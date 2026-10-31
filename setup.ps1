@@ -50,6 +50,9 @@ $OllamaUrl = "http://127.0.0.1:11434"
 $OmpExe = Join-Path $env:LOCALAPPDATA "omp\omp.exe"
 $ObsidianExe = Join-Path $env:LOCALAPPDATA "Programs\Obsidian\Obsidian.exe"
 $Utf8NoBom = New-Object System.Text.UTF8Encoding $false
+# Plain .cmd launchers live here; desktop shortcuts point at them without
+# arguments, which antivirus heuristics flag far less than cmd.exe /k ... links.
+$LaunchersDir = Join-Path $env:LOCALAPPDATA "MyLocalAI"
 
 # The uncensored GGUF on Hugging Face ships no chat template, so Ollama would
 # not format tool calls; it is rebuilt under this name with the renderer and
@@ -327,6 +330,53 @@ function Install-OllamaModel([string]$Name) {
     return New-OllamaModelFromHf $Name $mirror.Source $mirror.Renderer $mirror.Parser $mirror.Params
 }
 
+# Writes "$LaunchersDir\$Title.cmd" running `$Commands`, then a desktop
+# shortcut to it. If the shortcut cannot be saved (some antivirus products
+# block it), the .cmd itself is copied to the desktop instead; setup goes on.
+function New-Launcher([string]$Title, [string[]]$Commands, [string]$Description, [string]$Icon = "") {
+    New-Item -ItemType Directory -Force -Path $LaunchersDir | Out-Null
+    $cmdPath = Join-Path $LaunchersDir "$Title.cmd"
+    $body = @("@echo off", "chcp 65001 >nul") + $Commands
+    [System.IO.File]::WriteAllText($cmdPath, (($body -join "`r`n") + "`r`n"), $Utf8NoBom)
+    New-DesktopShortcut $Title $cmdPath $LaunchersDir $Description $Icon -FallbackCopy $cmdPath
+}
+
+function New-DesktopShortcut([string]$Title, [string]$Target, [string]$WorkDir, [string]$Description, [string]$Icon = "", [string]$FallbackCopy = "") {
+    $desktop = [Environment]::GetFolderPath("Desktop")
+    New-Item -ItemType Directory -Force -Path $desktop | Out-Null
+    $lnkPath = Join-Path $desktop "$Title.lnk"
+    try {
+        $link = (New-Object -ComObject WScript.Shell).CreateShortcut($lnkPath)
+        $link.TargetPath = $Target
+        $link.WorkingDirectory = $WorkDir
+        if ($Icon) { $link.IconLocation = $Icon }
+        $link.Description = $Description
+        $link.Save()
+    } catch {
+        Write-Warn "Ярлык «$Title» не сохранился: $($_.Exception.Message)"
+    }
+    if (Test-Path -LiteralPath $lnkPath) {
+        Write-Ok "Ярлык «$Title» на рабочем столе"
+        return
+    }
+    if ($FallbackCopy) {
+        try {
+            Copy-Item -LiteralPath $FallbackCopy -Destination (Join-Path $desktop "$Title.cmd") -Force
+            Write-Warn "Вместо ярлыка положил на рабочий стол файл «$Title.cmd» — он работает так же."
+            return
+        } catch { }
+    }
+    Write-Warn "Не удалось создать ярлык «$Title» (возможно, мешает антивирус). Запускайте: $Target"
+}
+
+# Lines for a launcher that opens the assistant in the vault, optionally on a
+# given model; the window stays open if omp exits with an error.
+function Get-AssistantCommands([string]$ModelArg = "") {
+    $run = "`"$OmpExe`""
+    if ($ModelArg) { $run += " --model $ModelArg" }
+    return @("cd /d `"$VaultPath`"", $run, "if errorlevel 1 pause")
+}
+
 function Restart-Ollama {
     Get-Process -Name "ollama app", "ollama" -ErrorAction SilentlyContinue | Stop-Process -Force
     Start-Sleep -Seconds 2
@@ -334,7 +384,7 @@ function Restart-Ollama {
     if (Test-Path -LiteralPath $trayApp) {
         Start-Process -FilePath $trayApp
     } else {
-        Start-Process -FilePath "ollama" -ArgumentList "serve" -WindowStyle Hidden
+        Start-Process -FilePath "ollama" -ArgumentList "serve" -WindowStyle Minimized
     }
     for ($i = 0; $i -lt 60; $i++) {
         if (Test-OllamaApi) { return }
@@ -885,28 +935,13 @@ if ($SkipImages) {
 
     # The assistant's models stay in VRAM for 30 minutes; free the card before
     # ComfyUI starts, or both will crawl.
-    $launcher = Join-Path $ImagesPath "start-comfyui.ps1"
-    $launcherText = @'
-# Frees the GPU from Ollama's models, then starts ComfyUI (it opens the browser).
-try {
-    $loaded = (Invoke-RestMethod -Uri "http://127.0.0.1:11434/api/ps" -TimeoutSec 3).models
-    foreach ($m in $loaded) { & ollama stop $m.name }
-} catch { }
-Set-Location -LiteralPath "__ROOT__"
-& .\python_embeded\python.exe -s ComfyUI\main.py --windows-standalone-build
-'@
-    [System.IO.File]::WriteAllText($launcher, $launcherText.Replace("__ROOT__", $ComfyRoot), (New-Object System.Text.UTF8Encoding $true))
-
-    $desktop = [Environment]::GetFolderPath("Desktop")
-    $shell = New-Object -ComObject WScript.Shell
-    $images = $shell.CreateShortcut((Join-Path $desktop "Картинки (ComfyUI).lnk"))
-    $images.TargetPath = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
-    $images.Arguments = "-NoProfile -ExecutionPolicy Bypass -NoExit -File `"$launcher`""
-    $images.WorkingDirectory = $ComfyRoot
-    $images.IconLocation = (Join-Path $ComfyRoot "python_embeded\python.exe") + ",0"
-    $images.Description = "Генерация картинок Qwen-Image 2.1 (откроется в браузере)"
-    $images.Save()
-    Write-Ok "Ярлык «Картинки (ComfyUI)» на рабочем столе"
+    $stopModels = @($MainModel, $FastModel, $SmartModel, $UncensoredName) | Where-Object { $_ } | Select-Object -Unique
+    $comfyCommands = @($stopModels | ForEach-Object { "ollama stop $_ >nul 2>&1" }) + @(
+        "cd /d `"$ComfyRoot`"",
+        ".\python_embeded\python.exe -s ComfyUI\main.py --windows-standalone-build",
+        "pause")
+    Remove-Item -LiteralPath (Join-Path $ImagesPath "start-comfyui.ps1") -Force -ErrorAction SilentlyContinue
+    New-Launcher "Картинки (ComfyUI)" $comfyCommands "Генерация картинок Qwen-Image 2.1 (откроется в браузере)" ((Join-Path $ComfyRoot "python_embeded\python.exe") + ",0")
 
     Write-Info "Проверяю, что ComfyUI видит видеокарту..."
     $torchCheck = Invoke-Native {
@@ -925,45 +960,14 @@ Set-Location -LiteralPath "__ROOT__"
 
 Write-Step "7/7 Ярлыки и проверка"
 
-$desktop = [Environment]::GetFolderPath("Desktop")
-$shell = New-Object -ComObject WScript.Shell
-
-$brain = $shell.CreateShortcut((Join-Path $desktop "Второй мозг (ИИ).lnk"))
-$brain.TargetPath = Join-Path $env:SystemRoot "System32\cmd.exe"
-$brain.Arguments = "/k cd /d `"$VaultPath`" && `"$OmpExe`""
-$brain.WorkingDirectory = $VaultPath
-$brain.IconLocation = "$OmpExe,0"
-$brain.Description = "Помощник с локальным ИИ для ваших заметок"
-$brain.Save()
-
-$smartShortcut = Join-Path $desktop "Второй мозг — умный режим (ИИ).lnk"
+New-Launcher "Второй мозг (ИИ)" (Get-AssistantCommands) "Помощник с локальным ИИ для ваших заметок" "$OmpExe,0"
 if ($smartReady) {
-    $smart = $shell.CreateShortcut($smartShortcut)
-    $smart.TargetPath = Join-Path $env:SystemRoot "System32\cmd.exe"
-    $smart.Arguments = "/k cd /d `"$VaultPath`" && `"$OmpExe`" --model ollama/$SmartModel"
-    $smart.WorkingDirectory = $VaultPath
-    $smart.IconLocation = "$OmpExe,0"
-    $smart.Description = "Помощник на большой модели ${SmartModel}: умнее, но медленнее"
-    $smart.Save()
-    Write-Ok "Ярлык «Второй мозг — умный режим (ИИ)» на рабочем столе"
+    New-Launcher "Второй мозг — умный режим (ИИ)" (Get-AssistantCommands "ollama/$SmartModel") "Помощник на большой модели ${SmartModel}: умнее, но медленнее" "$OmpExe,0"
 }
-
 if ($uncensoredReady) {
-    $free = $shell.CreateShortcut((Join-Path $desktop "Второй мозг — без цензуры (ИИ).lnk"))
-    $free.TargetPath = Join-Path $env:SystemRoot "System32\cmd.exe"
-    $free.Arguments = "/k cd /d `"$VaultPath`" && `"$OmpExe`" --model ollama/$UncensoredName"
-    $free.WorkingDirectory = $VaultPath
-    $free.IconLocation = "$OmpExe,0"
-    $free.Description = "Помощник на Qwen3.8 27B без цензуры: не отказывается отвечать"
-    $free.Save()
-    Write-Ok "Ярлык «Второй мозг — без цензуры (ИИ)» на рабочем столе"
+    New-Launcher "Второй мозг — без цензуры (ИИ)" (Get-AssistantCommands "ollama/$UncensoredName") "Помощник на Qwen3.8 27B без цензуры: не отказывается отвечать" "$OmpExe,0"
 }
-
-$notes = $shell.CreateShortcut((Join-Path $desktop "Заметки (Obsidian).lnk"))
-$notes.TargetPath = $ObsidianExe
-$notes.WorkingDirectory = Split-Path $ObsidianExe
-$notes.Save()
-Write-Ok "Ярлыки «Второй мозг (ИИ)» и «Заметки (Obsidian)» на рабочем столе"
+New-DesktopShortcut "Заметки (Obsidian)" $ObsidianExe (Split-Path $ObsidianExe) "Ваши заметки"
 
 if (-not $SkipModels) {
     Test-ModelOnGpu $MainModel
@@ -995,6 +999,7 @@ if ($imagesReady) {
 if ($OllamaModelsDir) {
     Write-Host "Модели ИИ лежат в: $OllamaModelsDir"
 }
+Write-Host "Файлы запуска (если ярлыков на рабочем столе нет): $LaunchersDir"
 Write-Host "Журнал установки: $LogFile"
 
 try { Stop-Transcript | Out-Null } catch { }

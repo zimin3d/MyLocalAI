@@ -18,6 +18,8 @@ $GuardHook = Join-Path $AgentDir "hooks\pre\vault-guard.ts"
 $OmpExe = Join-Path $env:LOCALAPPDATA "omp\omp.exe"
 $Desktop = [Environment]::GetFolderPath("Desktop")
 $Utf8NoBom = New-Object System.Text.UTF8Encoding $false
+# Same place setup.ps1 keeps its .cmd launchers.
+$LaunchersDir = Join-Path $env:LOCALAPPDATA "MyLocalAI"
 
 # Model ids are tried in order against the provider's live model list; the
 # first one the account can use wins, so a renamed model does not break setup.
@@ -81,8 +83,46 @@ function Get-VaultPath {
     return [string]($m.Groups[1].Value | ConvertFrom-Json)
 }
 
-function Get-ShortcutPath($Provider) {
-    return Join-Path $Desktop "Второй мозг — $($Provider.Name) (облако).lnk"
+function Get-LauncherTitle($Provider) {
+    return "Второй мозг — $($Provider.Name) (облако)"
+}
+
+# Every file a provider's launcher may have left: the .cmd, the desktop
+# shortcut, or the .cmd copied to the desktop when the shortcut was blocked.
+function Get-LauncherFiles($Provider) {
+    $title = Get-LauncherTitle $Provider
+    return @((Join-Path $LaunchersDir "$title.cmd"), (Join-Path $Desktop "$title.lnk"), (Join-Path $Desktop "$title.cmd"))
+}
+
+# Writes the .cmd launcher, then a desktop shortcut to it; when the shortcut
+# cannot be saved (some antivirus products block it) the .cmd is copied to
+# the desktop instead.
+function New-Launcher([string]$Title, [string[]]$Commands, [string]$Description, [string]$Icon) {
+    New-Item -ItemType Directory -Force -Path $LaunchersDir | Out-Null
+    $cmdPath = Join-Path $LaunchersDir "$Title.cmd"
+    $body = @("@echo off", "chcp 65001 >nul") + $Commands
+    [System.IO.File]::WriteAllText($cmdPath, (($body -join "`r`n") + "`r`n"), $Utf8NoBom)
+    $lnkPath = Join-Path $Desktop "$Title.lnk"
+    try {
+        $link = (New-Object -ComObject WScript.Shell).CreateShortcut($lnkPath)
+        $link.TargetPath = $cmdPath
+        $link.WorkingDirectory = $LaunchersDir
+        $link.IconLocation = $Icon
+        $link.Description = $Description
+        $link.Save()
+    } catch {
+        Write-Warn "Ярлык не сохранился: $($_.Exception.Message)"
+    }
+    if (Test-Path -LiteralPath $lnkPath) {
+        Write-Ok "Ярлык «$Title» на рабочем столе"
+        return
+    }
+    try {
+        Copy-Item -LiteralPath $cmdPath -Destination (Join-Path $Desktop "$Title.cmd") -Force
+        Write-Warn "Вместо ярлыка положил на рабочий стол файл «$Title.cmd» — он работает так же."
+    } catch {
+        Write-Warn "Не удалось создать ярлык (возможно, мешает антивирус). Запускайте: $cmdPath"
+    }
 }
 
 # Returns @{ BaseUrl; Models } for the first endpoint that accepts the key,
@@ -132,7 +172,7 @@ if ($choice -eq "3") {
     foreach ($p in $Providers.Values) {
         Set-EnvValue $p.KeyVar ""
         if ($p.Id -eq "moonshot") { Set-EnvValue "MOONSHOT_BASE_URL" "" }
-        Remove-Item -LiteralPath (Get-ShortcutPath $p) -Force -ErrorAction SilentlyContinue
+        foreach ($f in Get-LauncherFiles $p) { Remove-Item -LiteralPath $f -Force -ErrorAction SilentlyContinue }
     }
     Write-Ok "Облачные модели отключены, ключи удалены, ярлыки убраны."
     exit 0
@@ -186,15 +226,8 @@ if ($Provider.Id -eq "moonshot") {
 }
 Write-Ok "Ключ сохранён в $EnvFile"
 
-$shell = New-Object -ComObject WScript.Shell
-$link = $shell.CreateShortcut((Get-ShortcutPath $Provider))
-$link.TargetPath = Join-Path $env:SystemRoot "System32\cmd.exe"
-$link.Arguments = "/k cd /d `"$VaultPath`" && `"$OmpExe`" --model $($Provider.Id)/$model"
-$link.WorkingDirectory = $VaultPath
-$link.IconLocation = "$OmpExe,0"
-$link.Description = "Помощник на облачной модели $($Provider.Name) ($model)"
-$link.Save()
-Write-Ok "Ярлык «Второй мозг — $($Provider.Name) (облако)» на рабочем столе"
+$commands = @("cd /d `"$VaultPath`"", "`"$OmpExe`" --model $($Provider.Id)/$model", "if errorlevel 1 pause")
+New-Launcher (Get-LauncherTitle $Provider) $commands "Помощник на облачной модели $($Provider.Name) ($model)" "$OmpExe,0"
 
 Write-Host ""
 Write-Host "ГОТОВО! Откройте ярлык «Второй мозг — $($Provider.Name) (облако)»." -ForegroundColor Green
