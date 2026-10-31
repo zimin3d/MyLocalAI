@@ -61,10 +61,9 @@ $UncensoredName = "qwen3.8-uncensored:27b"
 # bonsai-2 (the smart model) needs the newest of the default models.
 $MinOllama = [version]"0.40.6"
 
-# Ollama's library serves model files from Cloudflare R2, which some networks
-# cannot reach (the pull hangs with "max retries exceeded"). The same models
-# are mirrored on Hugging Face (AWS CDN); when the library fails they are
-# pulled from there and re-created under the library name with the library's
+# Models are pulled only from Hugging Face: Ollama's own library serves its
+# files from Cloudflare R2, which some networks cannot reach. Each one is
+# re-created under its usual Ollama name with the official library model's
 # renderer, parser and sampling parameters, so tool calls work the same.
 $HfMirrors = @{
     "qwen3.5:9b"   = @{ Source = "hf.co/unsloth/Qwen3.5-9B-GGUF:Q4_K_M"
@@ -279,24 +278,6 @@ function Get-OllamaVersion {
     }
 }
 
-# True when Ollama's library can actually deliver files: fetches a manifest,
-# then the small config blob it names (served from the same storage as the
-# weights). A blocked network times out here in ~20 s instead of minutes.
-function Test-OllamaLibrary([string]$Model) {
-    $name, $tag = $Model.Split(":")
-    if (-not $tag) { $tag = "latest" }
-    if ($name.Contains("/")) { return $true }
-    $manifest = Invoke-Native {
-        & curl.exe -s --max-time 20 -H "Accept: application/vnd.docker.distribution.manifest.v2+json" "https://registry.ollama.ai/v2/library/$name/manifests/$tag"
-    }
-    try { $digest = ("$manifest" | ConvertFrom-Json).config.digest } catch { return $false }
-    if (-not $digest) { return $false }
-    $code = Invoke-Native {
-        & curl.exe -s -L -o NUL --max-time 20 -w "%{http_code}" "https://registry.ollama.ai/v2/library/$name/blobs/$digest"
-    }
-    return "$code" -eq "200"
-}
-
 # Pulls `$Source` (an hf.co/... reference), re-creates it as `$Name` with the
 # given renderer, parser and parameters, and drops the hf.co tag (the weights
 # stay, shared by the new name). Returns $true on success.
@@ -316,17 +297,19 @@ function New-OllamaModelFromHf([string]$Name, [string]$Source, [string]$Renderer
     return $created
 }
 
-# Gets a model under its library name: from Ollama's library unless it is
-# known to be unreachable, otherwise (or after a failed pull) from the
-# Hugging Face mirror. Returns $true on success.
+# Gets a model from Hugging Face: a name from $HfMirrors is re-created under
+# that name; an explicit hf.co/... reference is pulled as is. Returns $true on
+# success.
 function Install-OllamaModel([string]$Name) {
-    if (-not $script:UseHfMirror) {
+    if ($Name -like "hf.co/*") {
         Invoke-Native { ollama pull $Name }
-        if ($LASTEXITCODE -eq 0) { return $true }
+        return $LASTEXITCODE -eq 0
     }
     $mirror = $HfMirrors[$Name]
-    if (-not $mirror) { return $false }
-    Write-Info "Качаю $Name с Hugging Face..."
+    if (-not $mirror) {
+        Write-Warn "Для модели $Name нет источника на Hugging Face. Доступны: $(($HfMirrors.Keys | Sort-Object) -join ', ') или ссылка вида hf.co/автор/репозиторий:файл."
+        return $false
+    }
     return New-OllamaModelFromHf $Name $mirror.Source $mirror.Renderer $mirror.Parser $mirror.Params
 }
 
@@ -584,20 +567,11 @@ if ($ollamaVersion -and $ollamaVersion -lt $MinOllama) {
 }
 if ($ollamaVersion) { Write-Ok "Ollama $ollamaVersion" }
 
-$script:UseHfMirror = $false
 if ($SkipModels) {
     Write-Warn "Скачивание моделей пропущено (-SkipModels)"
 } else {
-    Write-Info "Проверяю, доступна ли библиотека моделей Ollama..."
-    if (Test-OllamaLibrary $MainModel) {
-        Write-Ok "Библиотека Ollama доступна"
-    } else {
-        $script:UseHfMirror = $true
-        Write-Warn "Библиотека Ollama недоступна из вашей сети (её файлы лежат в Cloudflare)."
-        Write-Warn "Качаю те же модели с Hugging Face."
-    }
     foreach ($model in @($MainModel, $FastModel)) {
-        Write-Info "Скачиваю модель $model (прогресс ниже)..."
+        Write-Info "Скачиваю модель $model с Hugging Face (прогресс ниже)..."
         if (-not (Install-OllamaModel $model)) {
             Stop-WithError "Не удалось скачать $model. Проверьте интернет (если сайты блокируются — включите VPN) и запустите установку снова — скачивание продолжится."
         }
@@ -608,7 +582,7 @@ if ($SkipModels) {
 # The smart model is optional: a failed download leaves the main setup working.
 $smartReady = $false
 if ($SmartModel -and -not $SkipModels) {
-    Write-Info "Скачиваю модель для «умного режима» $SmartModel (~8 ГБ)..."
+    Write-Info "Скачиваю модель для «умного режима» $SmartModel с Hugging Face (~8 ГБ)..."
     if (Install-OllamaModel $SmartModel) {
         $smartReady = $true
         Write-Ok "Модель $SmartModel готова"
@@ -675,8 +649,10 @@ if (-not (($userPath -split ";") -contains $ompDir)) {
     [Environment]::SetEnvironmentVariable("Path", (($userPath.TrimEnd(";"), $ompDir) -join ";").TrimStart(";"), "User")
 }
 Update-SessionPath
-$ompVersion = Invoke-Native { & $OmpExe --version }
-Write-Ok "omp: $ompVersion"
+# Integrity is proven by the SHA-256 check; the fresh binary is not executed
+# here, since "download an .exe and run it" is what behaviour-based antivirus
+# (Kaspersky PDM) flags as a dropper.
+Write-Ok "omp $($release.tag_name) установлен: $OmpExe"
 
 $agentDir = Join-Path $env:USERPROFILE ".omp\agent"
 New-Item -ItemType Directory -Force -Path $agentDir | Out-Null
