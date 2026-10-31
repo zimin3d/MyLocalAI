@@ -7,7 +7,7 @@
 #    3. Настраивает Ollama под 12 ГБ видеопамяти и скачивает модели:
 #       qwen3.5:9b (основная), qwen3.5:4b (быстрая), bonsai-2:27b («умный режим»),
 #       Qwen3.8 27B abliterated («без цензуры»)
-#    4. Ставит Oh My Pi (omp), подключает его к локальным моделям и запирает
+#    4. Ставит Oh My Pi (omp) и окно OMP Desktop, подключает omp к локальным моделям и запирает
 #       в папке заметок (хук vault-guard.ts: файлы вне папки, команды и код недоступны)
 #    5. Создаёт хранилище заметок "Второй мозг" с инструкцией для ИИ
 #    6. Ставит генерацию картинок: ComfyUI + Qwen-Image 2.1 Uncensored
@@ -23,6 +23,7 @@
 #    -SmartModel ""            не ставить модель для «умного режима»
 #    -UncensoredModel ""       не ставить модель «без цензуры»
 #    -SkipImages               не ставить генерацию картинок (~20 ГБ)
+#    -SkipDesktop              не ставить окно OMP Desktop (останется только терминал)
 #    -ImagesPath "D:\AI"       куда ставить ComfyUI (по умолчанию — папка установки)
 # =====================================================================
 
@@ -35,6 +36,7 @@ param(
     [int]$ContextLength = 32768,
     [switch]$SkipModels,
     [switch]$SkipImages,
+    [switch]$SkipDesktop,
     [string]$ImagesPath = "",
     [string]$InstallRoot = ""
 )
@@ -360,6 +362,28 @@ function Get-AssistantCommands([string]$ModelArg = "") {
     return @("cd /d `"$VaultPath`"", $run, "if errorlevel 1 pause")
 }
 
+# Path of OMP Desktop's main .exe from its uninstall entry (per-user or
+# machine-wide), or "" when it is not installed. Read from the registry rather
+# than guessed: the binary name depends on the Tauri version that built it.
+function Find-OmpDesktop {
+    $roots = @(
+        "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*",
+        "HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*",
+        "HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*")
+    foreach ($entry in Get-ItemProperty -Path $roots -ErrorAction SilentlyContinue) {
+        if ($entry.DisplayName -notlike "OMP Desktop*") { continue }
+        $icon = ("$($entry.DisplayIcon)" -replace ",\s*-?\d+$", "").Trim().Trim('"')
+        if ($icon -like "*.exe" -and (Test-Path -LiteralPath $icon)) { return $icon }
+        $dir = "$($entry.InstallLocation)".Trim('"')
+        if ($dir -and (Test-Path -LiteralPath $dir)) {
+            $exe = Get-ChildItem -LiteralPath $dir -Filter *.exe -ErrorAction SilentlyContinue |
+                Where-Object { $_.Name -notmatch "uninstall" } | Select-Object -First 1
+            if ($exe) { return $exe.FullName }
+        }
+    }
+    return ""
+}
+
 function Restart-Ollama {
     Get-Process -Name "ollama app", "ollama" -ErrorAction SilentlyContinue | Stop-Process -Force
     Start-Sleep -Seconds 2
@@ -654,6 +678,44 @@ Update-SessionPath
 # (Kaspersky PDM) flags as a dropper.
 Write-Ok "omp $($release.tag_name) установлен: $OmpExe"
 
+# OMP Desktop: a windowed front end (like the Codex or Claude desktop apps)
+# that runs this same omp in RPC mode, so models, keys, AGENTS.md and the
+# vault guard all apply. Optional: a failure warns and setup carries on.
+$DesktopExe = ""
+if ($SkipDesktop) {
+    Write-Warn "Окно OMP Desktop пропущено (-SkipDesktop)"
+} else {
+    try {
+        $desktopRelease = Invoke-RestMethod -Uri "https://api.github.com/repos/apoc/omp-desktop/releases/latest" -Headers @{ "User-Agent" = "MyLocalAI-setup" } -TimeoutSec 60
+        $desktopVersion = "$($desktopRelease.tag_name)".TrimStart("v")
+        $DesktopExe = Find-OmpDesktop
+        $installedVersion = if ($DesktopExe) { (Get-Item -LiteralPath $DesktopExe).VersionInfo.ProductVersion } else { "" }
+        if ($DesktopExe -and $installedVersion -eq $desktopVersion) {
+            Write-Ok "OMP Desktop $desktopVersion уже установлен"
+        } else {
+            $setupAsset = $desktopRelease.assets | Where-Object { $_.name -like "*_x64-setup.exe" } | Select-Object -First 1
+            $setupSha256 = "$($setupAsset.digest)" -replace "^sha256:", ""
+            if (-not $setupAsset -or $setupSha256 -notmatch "^[0-9a-fA-F]{64}$") {
+                throw "в выпуске $($desktopRelease.tag_name) нет установщика для Windows с контрольной суммой"
+            }
+            $setupPath = Join-Path $env:TEMP $setupAsset.name
+            Get-VerifiedFile $setupAsset.browser_download_url $setupPath $setupSha256 "OMP Desktop $desktopVersion ($([math]::Round($setupAsset.size / 1MB)) МБ)"
+            Write-Info "Устанавливаю OMP Desktop..."
+            $proc = Start-Process -FilePath $setupPath -ArgumentList "/S" -Wait -PassThru
+            Remove-Item -LiteralPath $setupPath -Force -ErrorAction SilentlyContinue
+            $DesktopExe = Find-OmpDesktop
+            if ($proc.ExitCode -ne 0 -or -not $DesktopExe) {
+                throw "установщик завершился с кодом $($proc.ExitCode)"
+            }
+            Write-Ok "OMP Desktop $desktopVersion установлен: $DesktopExe"
+        }
+    } catch {
+        $DesktopExe = Find-OmpDesktop
+        Write-Warn "Не удалось установить OMP Desktop: $($_.Exception.Message)"
+        Write-Warn "Помощник работает и без него — через окно терминала."
+    }
+}
+
 $agentDir = Join-Path $env:USERPROFILE ".omp\agent"
 New-Item -ItemType Directory -Force -Path $agentDir | Out-Null
 $configFile = Join-Path $agentDir "config.yml"
@@ -943,6 +1005,9 @@ if ($smartReady) {
 if ($uncensoredReady) {
     New-Launcher "Второй мозг — без цензуры (ИИ)" (Get-AssistantCommands "ollama/$UncensoredName") "Помощник на Qwen3.8 27B без цензуры: не отказывается отвечать" "$OmpExe,0"
 }
+if ($DesktopExe) {
+    New-Launcher "Второй мозг (окно)" @("start `"`" `"$DesktopExe`" `"$VaultPath`"") "Помощник в отдельном окне (OMP Desktop), открывает папку заметок" "$DesktopExe,0"
+}
 New-DesktopShortcut "Заметки (Obsidian)" $ObsidianExe (Split-Path $ObsidianExe) "Ваши заметки"
 
 if (-not $SkipModels) {
@@ -959,7 +1024,11 @@ Write-Host ""
 Write-Host "=================================================================" -ForegroundColor Green
 Write-Host "   ГОТОВО!" -ForegroundColor Green
 Write-Host "=================================================================" -ForegroundColor Green
-Write-Host "Откройте на рабочем столе ярлык «Второй мозг (ИИ)» и напишите, например:"
+if ($DesktopExe) {
+    Write-Host "Откройте на рабочем столе ярлык «Второй мозг (окно)» (или «Второй мозг (ИИ)» — то же в терминале) и напишите, например:"
+} else {
+    Write-Host "Откройте на рабочем столе ярлык «Второй мозг (ИИ)» и напишите, например:"
+}
 Write-Host "    Запиши: купить подарок Ане до пятницы" -ForegroundColor White
 if ($smartReady) {
     Write-Host "Для сложных вопросов есть ярлык «Второй мозг — умный режим (ИИ)» — умнее, но отвечает медленнее."
