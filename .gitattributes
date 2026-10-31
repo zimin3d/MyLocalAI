@@ -5,3 +5,4 @@
 *.txt  -text
 *.json -text
 *.md   text eol=lf
+*.ts   text eol=lf

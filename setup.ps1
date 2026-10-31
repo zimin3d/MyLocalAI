@@ -6,7 +6,8 @@
 #    2. Ставит Git (нужен omp для команд), Ollama (локальные модели), Obsidian (заметки)
 #    3. Настраивает Ollama под 12 ГБ видеопамяти и скачивает модели:
 #       qwen3.5:9b (основная), qwen3.5:4b (быстрая), bonsai-2:27b («умный режим»)
-#    4. Ставит Oh My Pi (omp) и подключает его к локальным моделям
+#    4. Ставит Oh My Pi (omp), подключает его к локальным моделям и запирает
+#       в папке заметок (хук vault-guard.ts: файлы вне папки, команды и код недоступны)
 #    5. Создаёт хранилище заметок "Второй мозг" с инструкцией для ИИ
 #    6. Ставит генерацию картинок: ComfyUI + Qwen-Image 2.1 Uncensored
 #    7. Кладёт ярлыки на рабочий стол и проверяет, что модель работает на видеокарте
@@ -59,6 +60,7 @@ $ImageFiles = @(
        Sha256 = "bb21f7473051e1ac368515dd3f2e15cd44d7a11748ee8823e1ddca3e4876b7c9" }
 )
 $WorkflowFile = Join-Path $PSScriptRoot "qwen-image-2.1-uncensored.json"
+$GuardFile = Join-Path $PSScriptRoot "vault-guard.ts"
 $SevenZipExe = Join-Path $env:ProgramFiles "7-Zip\7z.exe"
 
 if (-not $ImagesPath) {
@@ -223,6 +225,9 @@ if (-not (Test-Command "winget")) {
 }
 Write-Ok "winget есть"
 
+if (-not (Test-Path -LiteralPath $GuardFile)) {
+    Stop-WithError "Рядом со скриптом нет файла vault-guard.ts. Скопируйте папку установки целиком."
+}
 if (-not $SkipImages -and -not (Test-Path -LiteralPath $WorkflowFile)) {
     Stop-WithError "Рядом со скриптом нет файла qwen-image-2.1-uncensored.json. Скопируйте папку установки целиком."
 }
@@ -367,10 +372,72 @@ $config = @'
 modelRoles:
   default: ollama/__MAIN__
   smol: ollama/__FAST__
+
+# Помощник работает только с заметками. Главная защита — хук
+# hooks/pre/vault-guard.ts (блокирует всё за пределами папки заметок);
+# настройки ниже вдобавок убирают лишние инструменты, чтобы модель
+# их даже не видела.
+bash:
+  enabled: false
+eval:
+  py: false
+  js: false
+browser:
+  enabled: false
+lsp:
+  enabled: false
+async:
+  enabled: false
+tools:
+  approval:
+    bash: deny
+    eval: deny
+    task: deny
+    browser: deny
+    computer: deny
+    debug: deny
+    ida: deny
+    github: deny
+    lsp: deny
+    ast_grep: deny
+    ast_edit: deny
+    security_scan: deny
+    manage_skill: deny
+    checkpoint: deny
+    rewind: deny
+# Не подхватывать настройки, MCP-серверы и хуки других ИИ-программ.
+disabledProviders:
+  - claude
+  - claude-plugins
+  - claude-md
+  - codex
+  - gemini
+  - github
+  - opencode
+  - cursor
+  - windsurf
+  - cline
+  - vscode
+  - agents
+  - agents-md
+  - agent-plugins
+  - omp-plugins
+  - mcp-json
+  - ssh-json
+  - custom-context
 '@
 $config = $config.Replace("__MAIN__", $MainModel).Replace("__FAST__", $FastModel)
 [System.IO.File]::WriteAllText($configFile, $config, $Utf8NoBom)
 Write-Ok "omp подключён к локальным моделям ($MainModel, $FastModel)"
+
+# The guard lives in the user agent folder, outside the vault, so the agent
+# cannot rewrite it. The vault path is baked in as a JSON string literal.
+$hookDir = Join-Path $agentDir "hooks\pre"
+New-Item -ItemType Directory -Force -Path $hookDir | Out-Null
+$vaultLiteral = ConvertTo-Json -InputObject ([string]$VaultPath) -Compress
+$guard = (Get-Content -LiteralPath $GuardFile -Raw -Encoding UTF8).Replace("__VAULT__", $vaultLiteral)
+[System.IO.File]::WriteAllText((Join-Path $hookDir "vault-guard.ts"), $guard, $Utf8NoBom)
+Write-Ok "Помощник ограничен папкой заметок: $VaultPath"
 
 # ---------------------------------------------------------------- 5. vault
 
@@ -425,6 +492,8 @@ $agentsMd = @'
 - Никогда не удаляй заметки и не перезаписывай их целиком без явного «да» от пользователя.
 - Не трогай папки `.obsidian/` и `.omp/`.
 - Работай только внутри этой папки: не запускай программы и не меняй файлы за её пределами.
+- Доступ и так ограничен: файлы вне этой папки, команды и запуск программ заблокированы.
+  Если действие заблокировано — не ищи обходных путей, а коротко объясни пользователю, что это недоступно.
 - Не выдумывай факты о пользователе: если чего-то нет в заметках — так и скажи.
 '@
 Write-FileIfMissing (Join-Path $VaultPath ".omp\AGENTS.md") $agentsMd
