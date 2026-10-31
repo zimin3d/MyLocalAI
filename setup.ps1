@@ -5,7 +5,7 @@
 #    1. Проверяет видеокарту NVIDIA и драйвер
 #    2. Ставит Git (нужен omp для команд), Ollama (локальные модели), Obsidian (заметки)
 #    3. Настраивает Ollama под 12 ГБ видеопамяти и скачивает модели:
-#       gemma4:12b (основная), bonsai-2:4b (быстрая), bonsai-2:27b («умный режим»),
+#       qwen3.5:9b (основная), qwen3.5:4b (быстрая), bonsai-2:27b («умный режим»),
 #       Qwen3.8 27B abliterated («без цензуры»)
 #    4. Ставит Oh My Pi (omp), подключает его к локальным моделям и запирает
 #       в папке заметок (хук vault-guard.ts: файлы вне папки, команды и код недоступны)
@@ -28,8 +28,8 @@
 
 param(
     [string]$VaultPath = "",
-    [string]$MainModel = "gemma4:12b",
-    [string]$FastModel = "bonsai-2:4b",
+    [string]$MainModel = "qwen3.5:9b",
+    [string]$FastModel = "qwen3.5:4b",
     [string]$SmartModel = "bonsai-2:27b",
     [string]$UncensoredModel = "hf.co/huihui-ai/Huihui-Qwen3.8-27B-abliterated-GGUF:UD-IQ2_S",
     [int]$ContextLength = 32768,
@@ -55,7 +55,7 @@ $Utf8NoBom = New-Object System.Text.UTF8Encoding $false
 # not format tool calls; it is rebuilt under this name with the renderer and
 # parser of the official qwen3.8 model (needs Ollama 0.32.12+).
 $UncensoredName = "qwen3.8-uncensored:27b"
-# bonsai-2 (fast and smart models) needs the newest of the default models.
+# bonsai-2 (the smart model) needs the newest of the default models.
 $MinOllama = [version]"0.40.6"
 
 # Ollama's library serves model files from Cloudflare R2, which some networks
@@ -64,6 +64,12 @@ $MinOllama = [version]"0.40.6"
 # pulled from there and re-created under the library name with the library's
 # renderer, parser and sampling parameters, so tool calls work the same.
 $HfMirrors = @{
+    "qwen3.5:9b"   = @{ Source = "hf.co/unsloth/Qwen3.5-9B-GGUF:Q4_K_M"
+                        Renderer = "qwen3.5"; Parser = "qwen3.5"
+                        Params = [ordered]@{ presence_penalty = 1.5; temperature = 1; top_k = 20; top_p = 0.95 } }
+    "qwen3.5:4b"   = @{ Source = "hf.co/unsloth/Qwen3.5-4B-GGUF:Q4_K_M"
+                        Renderer = "qwen3.5"; Parser = "qwen3.5"
+                        Params = [ordered]@{ presence_penalty = 1.5; temperature = 1; top_k = 20; top_p = 0.95 } }
     "gemma4:12b"   = @{ Source = "hf.co/unsloth/gemma-4-12b-it-GGUF:Q4_K_M"
                         Renderer = "gemma4"; Parser = "gemma4"
                         Params = [ordered]@{ temperature = 1; top_k = 64; top_p = 0.95 } }
@@ -398,7 +404,7 @@ if (Test-Path -LiteralPath $nvidiaSmi) {
 # get lighter defaults; anything passed explicitly on the command line wins.
 if ($vramGb -gt 0 -and $vramGb -lt 11) {
     Write-Warn "Видеопамяти $vramGb ГБ — включаю облегчённый режим (рассчитано на 12 ГБ):"
-    if (-not $PSBoundParameters.ContainsKey("MainModel")) { $MainModel = "bonsai-2:9b" }
+    if (-not $PSBoundParameters.ContainsKey("MainModel")) { $MainModel = "qwen3.5:4b" }
     if (-not $PSBoundParameters.ContainsKey("SmartModel")) { $SmartModel = "" }
     if (-not $PSBoundParameters.ContainsKey("UncensoredModel")) { $UncensoredModel = "" }
     Write-Warn "  основная модель $MainModel, «умный режим» и модель «без цензуры» не ставятся."
