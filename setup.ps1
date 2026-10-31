@@ -275,6 +275,49 @@ if (-not $SkipImages -and -not (Test-Path -LiteralPath $WorkflowFile)) {
     Stop-WithError "Рядом со скриптом нет файла qwen-image-2.1-uncensored.json. Скопируйте папку установки целиком."
 }
 
+$ramGb = [math]::Round((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1GB)
+Write-Ok "Оперативная память: $ramGb ГБ"
+
+# ComfyUI portable ships PyTorch built for CUDA 13.0, which needs driver 580+.
+# Ollama alone runs on older drivers, so an old driver is a warning, not a stop.
+$MinDriver = 580
+$vramGb = 0
+$nvidiaSmi = Join-Path $env:SystemRoot "System32\nvidia-smi.exe"
+if (Test-Path -LiteralPath $nvidiaSmi) {
+    try {
+        $gpuLine = (& $nvidiaSmi --query-gpu=name,driver_version,memory.total --format=csv,noheader,nounits | Select-Object -First 1)
+        $gpu = $gpuLine.Split(",") | ForEach-Object { $_.Trim() }
+        $vramGb = [math]::Round([double]$gpu[2] / 1024, 1)
+        Write-Ok "Видеокарта: $($gpu[0]), память $vramGb ГБ, драйвер $($gpu[1])"
+        $driverMajor = [int]($gpu[1].Split(".")[0])
+        if ($driverMajor -lt $MinDriver) {
+            Write-Warn "Драйвер $($gpu[1]) устарел: нужен $MinDriver или новее, иначе программа для картинок не запустится."
+            Write-Warn "Обновите драйвер через приложение NVIDIA: https://www.nvidia.com/ru-ru/software/nvidia-app/"
+            Write-Warn "Установка продолжится, после обновления драйвера ничего переустанавливать не нужно."
+        }
+    } catch {
+        Write-Warn "Не удалось прочитать данные видеокарты: $_"
+    }
+} else {
+    Write-Warn "Драйвер NVIDIA не найден. Установите его: https://www.nvidia.com/ru-ru/software/nvidia-app/"
+    Write-Warn "Без драйвера модели будут работать очень медленно (на процессоре)."
+}
+
+# Defaults target 12 GB cards (RTX 3060 12 GB, 4070, 5070, …). Smaller cards
+# get lighter defaults; anything passed explicitly on the command line wins.
+if ($vramGb -gt 0 -and $vramGb -lt 11) {
+    Write-Warn "Видеопамяти $vramGb ГБ — включаю облегчённый режим (рассчитано на 12 ГБ):"
+    if (-not $PSBoundParameters.ContainsKey("MainModel")) { $MainModel = "qwen3.5:4b" }
+    if (-not $PSBoundParameters.ContainsKey("SmartModel")) { $SmartModel = "" }
+    Write-Warn "  основная модель $MainModel, «умный режим» не ставится."
+    if ($vramGb -lt 7) {
+        if (-not $PSBoundParameters.ContainsKey("SkipImages")) { $SkipImages = $true }
+        if ($SkipImages) { Write-Warn "  генерация картинок не ставится: ей нужно хотя бы 8 ГБ видеопамяти." }
+    } elseif (-not $SkipImages) {
+        Write-Warn "  картинки будут рисоваться заметно медленнее: модель не помещается в видеопамять целиком."
+    }
+}
+
 # Programs (Git, Ollama, Obsidian, omp) always go to the system disk; the
 # heavy parts — Ollama models, ComfyUI and its models — go to the chosen one.
 $programsGb = 5
@@ -323,29 +366,6 @@ if ($dataDrive -eq $env:SystemDrive) {
     Write-Ok "Программы: диск $($env:SystemDrive) (~$programsGb ГБ, свободно $systemFree ГБ)"
 }
 Write-Ok "Заметки: $VaultPath"
-
-$ramGb = [math]::Round((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1GB)
-Write-Ok "Оперативная память: $ramGb ГБ"
-
-$nvidiaSmi = Join-Path $env:SystemRoot "System32\nvidia-smi.exe"
-if (Test-Path -LiteralPath $nvidiaSmi) {
-    try {
-        $gpuLine = (& $nvidiaSmi --query-gpu=name,driver_version,memory.total --format=csv,noheader | Select-Object -First 1)
-        $gpu = $gpuLine.Split(",") | ForEach-Object { $_.Trim() }
-        Write-Ok "Видеокарта: $($gpu[0]), память $($gpu[2]), драйвер $($gpu[1])"
-        $driverMajor = [int]($gpu[1].Split(".")[0])
-        if ($driverMajor -lt 570) {
-            Write-Warn "Драйвер слишком старый для RTX 50-й серии — модели пойдут на процессор и будут медленными."
-            Write-Warn "Обновите драйвер через приложение NVIDIA: https://www.nvidia.com/ru-ru/software/nvidia-app/"
-            Write-Warn "Установка продолжится, после обновления драйвера ничего переустанавливать не нужно."
-        }
-    } catch {
-        Write-Warn "Не удалось прочитать данные видеокарты: $_"
-    }
-} else {
-    Write-Warn "Драйвер NVIDIA не найден. Установите его: https://www.nvidia.com/ru-ru/software/nvidia-app/"
-    Write-Warn "Без драйвера модели будут работать очень медленно (на процессоре)."
-}
 
 # ---------------------------------------------------------------- 2. programs
 
