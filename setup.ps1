@@ -5,7 +5,7 @@
 #    1. Проверяет видеокарту NVIDIA и драйвер
 #    2. Ставит Git (нужен omp для команд), Ollama (локальные модели), Obsidian (заметки)
 #    3. Настраивает Ollama под 12 ГБ видеопамяти и скачивает модели:
-#       qwen3.5:9b (основная), qwen3.5:4b (быстрая), bonsai-2:27b («умный режим»),
+#       gemma4:12b (основная), bonsai-2:4b (быстрая), bonsai-2:27b («умный режим»),
 #       Qwen3.8 27B abliterated («без цензуры»)
 #    4. Ставит Oh My Pi (omp), подключает его к локальным моделям и запирает
 #       в папке заметок (хук vault-guard.ts: файлы вне папки, команды и код недоступны)
@@ -28,8 +28,8 @@
 
 param(
     [string]$VaultPath = "",
-    [string]$MainModel = "qwen3.5:9b",
-    [string]$FastModel = "qwen3.5:4b",
+    [string]$MainModel = "gemma4:12b",
+    [string]$FastModel = "bonsai-2:4b",
     [string]$SmartModel = "bonsai-2:27b",
     [string]$UncensoredModel = "hf.co/huihui-ai/Huihui-Qwen3.8-27B-abliterated-GGUF:UD-IQ2_S",
     [int]$ContextLength = 32768,
@@ -55,6 +55,8 @@ $Utf8NoBom = New-Object System.Text.UTF8Encoding $false
 # not format tool calls; it is rebuilt under this name with the renderer and
 # parser of the official qwen3.8 model (needs Ollama 0.32.12+).
 $UncensoredName = "qwen3.8-uncensored:27b"
+# bonsai-2 (fast and smart models) needs the newest of the default models.
+$MinOllama = [version]"0.40.6"
 $UncensoredMinOllama = [version]"0.32.12"
 
 # Image generation: ComfyUI portable + Qwen-Image 2.1 Uncensored. Versions and
@@ -239,6 +241,15 @@ function Get-FreeGb([string]$Path) {
     return [math]::Round($drive.Free / 1GB)
 }
 
+function Get-OllamaVersion {
+    try {
+        $raw = (Invoke-RestMethod -Uri "$OllamaUrl/api/version" -TimeoutSec 5).version
+        return [version](($raw -split "[-+]")[0])
+    } catch {
+        return $null
+    }
+}
+
 function Restart-Ollama {
     Get-Process -Name "ollama app", "ollama" -ErrorAction SilentlyContinue | Stop-Process -Force
     Start-Sleep -Seconds 2
@@ -316,7 +327,7 @@ if (Test-Path -LiteralPath $nvidiaSmi) {
 # get lighter defaults; anything passed explicitly on the command line wins.
 if ($vramGb -gt 0 -and $vramGb -lt 11) {
     Write-Warn "Видеопамяти $vramGb ГБ — включаю облегчённый режим (рассчитано на 12 ГБ):"
-    if (-not $PSBoundParameters.ContainsKey("MainModel")) { $MainModel = "qwen3.5:4b" }
+    if (-not $PSBoundParameters.ContainsKey("MainModel")) { $MainModel = "bonsai-2:9b" }
     if (-not $PSBoundParameters.ContainsKey("SmartModel")) { $SmartModel = "" }
     if (-not $PSBoundParameters.ContainsKey("UncensoredModel")) { $UncensoredModel = "" }
     Write-Warn "  основная модель $MainModel, «умный режим» и модель «без цензуры» не ставятся."
@@ -429,6 +440,23 @@ if ($OllamaModelsDir) { Write-Ok "Модели Ollama хранятся в $Ollam
 Restart-Ollama
 Write-Ok "Ollama запущена"
 
+# An Ollama installed earlier is left alone by winget install, and an old one
+# refuses newer models ("requires a newer version"), so upgrade it first.
+$ollamaVersion = Get-OllamaVersion
+if ($ollamaVersion -and $ollamaVersion -lt $MinOllama) {
+    Write-Info "Ollama $ollamaVersion устарела (нужна $MinOllama+), обновляю..."
+    Invoke-Native {
+        winget upgrade --id Ollama.Ollama -e --silent --accept-package-agreements --accept-source-agreements
+    }
+    Update-SessionPath
+    Restart-Ollama
+    $ollamaVersion = Get-OllamaVersion
+}
+if ($ollamaVersion -and $ollamaVersion -lt $MinOllama) {
+    Stop-WithError "Ollama $ollamaVersion слишком старая, а обновить её не получилось. Скачайте свежую с https://ollama.com/download, установите и запустите УСТАНОВИТЬ.cmd ещё раз."
+}
+if ($ollamaVersion) { Write-Ok "Ollama $ollamaVersion" }
+
 if ($SkipModels) {
     Write-Warn "Скачивание моделей пропущено (-SkipModels)"
 } else {
@@ -461,11 +489,7 @@ if ($SmartModel -and -not $SkipModels) {
 # afterwards (the weights stay, shared by the new name).
 $uncensoredReady = $false
 if ($UncensoredModel -and -not $SkipModels) {
-    $ollamaVersion = $null
-    try {
-        $raw = (Invoke-RestMethod -Uri "$OllamaUrl/api/version" -TimeoutSec 5).version
-        $ollamaVersion = [version](($raw -split "[-+]")[0])
-    } catch { }
+    $ollamaVersion = Get-OllamaVersion
     if ($ollamaVersion -and $ollamaVersion -lt $UncensoredMinOllama) {
         Write-Warn "Ollama $ollamaVersion слишком старая для модели «без цензуры» (нужна $UncensoredMinOllama+) — пропускаю."
         Write-Warn "Обновите Ollama (winget upgrade Ollama.Ollama) и запустите УСТАНОВИТЬ.cmd ещё раз."
