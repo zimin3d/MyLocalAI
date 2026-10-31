@@ -57,6 +57,26 @@ $Utf8NoBom = New-Object System.Text.UTF8Encoding $false
 $UncensoredName = "qwen3.8-uncensored:27b"
 # bonsai-2 (fast and smart models) needs the newest of the default models.
 $MinOllama = [version]"0.40.6"
+
+# Ollama's library serves model files from Cloudflare R2, which some networks
+# cannot reach (the pull hangs with "max retries exceeded"). The same models
+# are mirrored on Hugging Face (AWS CDN); when the library fails they are
+# pulled from there and re-created under the library name with the library's
+# renderer, parser and sampling parameters, so tool calls work the same.
+$HfMirrors = @{
+    "gemma4:12b"   = @{ Source = "hf.co/unsloth/gemma-4-12b-it-GGUF:Q4_K_M"
+                        Renderer = "gemma4"; Parser = "gemma4"
+                        Params = [ordered]@{ temperature = 1; top_k = 64; top_p = 0.95 } }
+    "bonsai-2:4b"  = @{ Source = "hf.co/prism-ml/Ternary-Bonsai-2-4B-gguf:Ternary-Bonsai-2-4B-Q2_0"
+                        Renderer = "qwen3.5"; Parser = "qwen3.5"
+                        Params = [ordered]@{ presence_penalty = 1; temperature = 1; top_k = 20; top_p = 0.95 } }
+    "bonsai-2:9b"  = @{ Source = "hf.co/prism-ml/Ternary-Bonsai-2-9B-gguf:Ternary-Bonsai-2-9B-Q2_0"
+                        Renderer = "qwen3.5"; Parser = "qwen3.5"
+                        Params = [ordered]@{ presence_penalty = 1; temperature = 1; top_k = 20; top_p = 0.95 } }
+    "bonsai-2:27b" = @{ Source = "hf.co/prism-ml/Ternary-Bonsai-2-27B-gguf:Ternary-Bonsai-2-27B-Q2_0"
+                        Renderer = "qwen3.8"; Parser = "qwen3.5"
+                        Params = [ordered]@{ min_p = 0.05; temperature = 1; top_k = 20; top_p = 0.95 } }
+}
 $UncensoredMinOllama = [version]"0.32.12"
 
 # Image generation: ComfyUI portable + Qwen-Image 2.1 Uncensored. Versions and
@@ -248,6 +268,57 @@ function Get-OllamaVersion {
     } catch {
         return $null
     }
+}
+
+# True when Ollama's library can actually deliver files: fetches a manifest,
+# then the small config blob it names (served from the same storage as the
+# weights). A blocked network times out here in ~20 s instead of minutes.
+function Test-OllamaLibrary([string]$Model) {
+    $name, $tag = $Model.Split(":")
+    if (-not $tag) { $tag = "latest" }
+    if ($name.Contains("/")) { return $true }
+    $manifest = Invoke-Native {
+        & curl.exe -s --max-time 20 -H "Accept: application/vnd.docker.distribution.manifest.v2+json" "https://registry.ollama.ai/v2/library/$name/manifests/$tag"
+    }
+    try { $digest = ("$manifest" | ConvertFrom-Json).config.digest } catch { return $false }
+    if (-not $digest) { return $false }
+    $code = Invoke-Native {
+        & curl.exe -s -L -o NUL --max-time 20 -w "%{http_code}" "https://registry.ollama.ai/v2/library/$name/blobs/$digest"
+    }
+    return "$code" -eq "200"
+}
+
+# Pulls `$Source` (an hf.co/... reference), re-creates it as `$Name` with the
+# given renderer, parser and parameters, and drops the hf.co tag (the weights
+# stay, shared by the new name). Returns $true on success.
+function New-OllamaModelFromHf([string]$Name, [string]$Source, [string]$Renderer, [string]$Parser, $Params) {
+    Invoke-Native { ollama pull $Source }
+    if ($LASTEXITCODE -ne 0) { return $false }
+    $lines = @("FROM $Source", "RENDERER $Renderer", "PARSER $Parser")
+    foreach ($key in $Params.Keys) {
+        $lines += "PARAMETER $key " + ([string]$Params[$key]).Replace(",", ".")
+    }
+    $modelfile = Join-Path $env:TEMP ("ollama-" + ($Name -replace "[^A-Za-z0-9.-]", "_") + ".Modelfile")
+    [System.IO.File]::WriteAllLines($modelfile, [string[]]$lines, $Utf8NoBom)
+    Invoke-Native { ollama create $Name -f $modelfile }
+    $created = $LASTEXITCODE -eq 0
+    Remove-Item -LiteralPath $modelfile -Force -ErrorAction SilentlyContinue
+    if ($created) { Invoke-Native { ollama rm $Source | Out-Null } }
+    return $created
+}
+
+# Gets a model under its library name: from Ollama's library unless it is
+# known to be unreachable, otherwise (or after a failed pull) from the
+# Hugging Face mirror. Returns $true on success.
+function Install-OllamaModel([string]$Name) {
+    if (-not $script:UseHfMirror) {
+        Invoke-Native { ollama pull $Name }
+        if ($LASTEXITCODE -eq 0) { return $true }
+    }
+    $mirror = $HfMirrors[$Name]
+    if (-not $mirror) { return $false }
+    Write-Info "Качаю $Name с Hugging Face..."
+    return New-OllamaModelFromHf $Name $mirror.Source $mirror.Renderer $mirror.Parser $mirror.Params
 }
 
 function Restart-Ollama {
@@ -457,14 +528,22 @@ if ($ollamaVersion -and $ollamaVersion -lt $MinOllama) {
 }
 if ($ollamaVersion) { Write-Ok "Ollama $ollamaVersion" }
 
+$script:UseHfMirror = $false
 if ($SkipModels) {
     Write-Warn "Скачивание моделей пропущено (-SkipModels)"
 } else {
+    Write-Info "Проверяю, доступна ли библиотека моделей Ollama..."
+    if (Test-OllamaLibrary $MainModel) {
+        Write-Ok "Библиотека Ollama доступна"
+    } else {
+        $script:UseHfMirror = $true
+        Write-Warn "Библиотека Ollama недоступна из вашей сети (её файлы лежат в Cloudflare)."
+        Write-Warn "Качаю те же модели с Hugging Face."
+    }
     foreach ($model in @($MainModel, $FastModel)) {
         Write-Info "Скачиваю модель $model (прогресс ниже)..."
-        Invoke-Native { ollama pull $model }
-        if ($LASTEXITCODE -ne 0) {
-            Stop-WithError "Не удалось скачать $model. Проверьте интернет и запустите установку снова — скачивание продолжится."
+        if (-not (Install-OllamaModel $model)) {
+            Stop-WithError "Не удалось скачать $model. Проверьте интернет (если сайты блокируются — включите VPN) и запустите установку снова — скачивание продолжится."
         }
         Write-Ok "Модель $model готова"
     }
@@ -474,8 +553,7 @@ if ($SkipModels) {
 $smartReady = $false
 if ($SmartModel -and -not $SkipModels) {
     Write-Info "Скачиваю модель для «умного режима» $SmartModel (~8 ГБ)..."
-    Invoke-Native { ollama pull $SmartModel }
-    if ($LASTEXITCODE -eq 0) {
+    if (Install-OllamaModel $SmartModel) {
         $smartReady = $true
         Write-Ok "Модель $SmartModel готова"
     } else {
@@ -495,28 +573,10 @@ if ($UncensoredModel -and -not $SkipModels) {
         Write-Warn "Обновите Ollama (winget upgrade Ollama.Ollama) и запустите УСТАНОВИТЬ.cmd ещё раз."
     } else {
         Write-Info "Скачиваю модель «без цензуры» Qwen3.8 27B (~9 ГБ)..."
-        Invoke-Native { ollama pull $UncensoredModel }
-        if ($LASTEXITCODE -eq 0) {
-            $modelfile = Join-Path $env:TEMP "qwen3.8-uncensored.Modelfile"
-            $modelfileText = @'
-FROM __SOURCE__
-RENDERER qwen3.8
-PARSER qwen3.5
-PARAMETER temperature 1
-PARAMETER top_k 20
-PARAMETER top_p 0.95
-PARAMETER min_p 0
-'@
-            [System.IO.File]::WriteAllText($modelfile, $modelfileText.Replace("__SOURCE__", $UncensoredModel), $Utf8NoBom)
-            Invoke-Native { ollama create $UncensoredName -f $modelfile }
-            if ($LASTEXITCODE -eq 0) {
-                Invoke-Native { ollama rm $UncensoredModel | Out-Null }
-                $uncensoredReady = $true
-                Write-Ok "Модель «без цензуры» готова: $UncensoredName"
-            } else {
-                Write-Warn "Не удалось подготовить модель «без цензуры» — пропускаю, остальное работает."
-            }
-            Remove-Item -LiteralPath $modelfile -Force -ErrorAction SilentlyContinue
+        $params = [ordered]@{ temperature = 1; top_k = 20; top_p = 0.95; min_p = 0 }
+        if (New-OllamaModelFromHf $UncensoredName $UncensoredModel "qwen3.8" "qwen3.5" $params) {
+            $uncensoredReady = $true
+            Write-Ok "Модель «без цензуры» готова: $UncensoredName"
         } else {
             Write-Warn "Не удалось скачать модель «без цензуры» — пропускаю, остальное работает."
             Write-Warn "Позже можно докачать: запустите УСТАНОВИТЬ.cmd ещё раз."
@@ -528,19 +588,37 @@ PARAMETER min_p 0
 
 Write-Step "4/7 Устанавливаю Oh My Pi (omp)"
 
-if (Test-Path -LiteralPath $OmpExe) {
-    Write-Ok "omp уже установлен, проверяю обновление..."
-}
-# The official installer verifies the binary's SHA-256 and adds omp to PATH.
+# omp's own installer downloads from Cloudflare R2, which some networks cannot
+# reach; the same binary is attached to GitHub releases with a SHA-256 digest.
+$ompAssetName = if ($env:PROCESSOR_ARCHITECTURE -eq "ARM64") { "omp-windows-arm64.exe" } else { "omp-windows-x64.exe" }
 try {
-    & ([scriptblock]::Create((Invoke-RestMethod -Uri "https://omp.sh/install.ps1"))) -Binary
+    $release = Invoke-RestMethod -Uri "https://api.github.com/repos/can1357/oh-my-pi/releases/latest" -Headers @{ "User-Agent" = "MyLocalAI-setup" } -TimeoutSec 60
 } catch {
-    Stop-WithError "Официальный установщик omp завершился с ошибкой: $_"
+    Stop-WithError "Не удалось узнать последнюю версию omp на GitHub: $_"
+}
+$ompAsset = $release.assets | Where-Object { $_.name -eq $ompAssetName } | Select-Object -First 1
+if (-not $ompAsset) {
+    Stop-WithError "В выпуске omp $($release.tag_name) нет файла $ompAssetName."
+}
+$ompSha256 = "$($ompAsset.digest)" -replace "^sha256:", ""
+if ($ompSha256 -notmatch "^[0-9a-fA-F]{64}$") {
+    $sums = $release.assets | Where-Object { $_.name -eq "SHA256SUMS.txt" } | Select-Object -First 1
+    $sumsText = if ($sums) { Invoke-Native { & curl.exe -s -L --max-time 60 $sums.browser_download_url } } else { "" }
+    # Native output arrives as an array of lines; split each one, never the joined string.
+    $sumsLines = @($sumsText | ForEach-Object { "$_" -split "\r?\n" })
+    $ompSha256 = ($sumsLines | Where-Object { $_ -match "^[0-9a-fA-F]{64}\s+\*?$([regex]::Escape($ompAssetName))\s*$" } | Select-Object -First 1) -replace "\s.*$", ""
+}
+if ($ompSha256 -notmatch "^[0-9a-fA-F]{64}$") {
+    Stop-WithError "Не удалось получить контрольную сумму omp $($release.tag_name)."
+}
+$ompDir = Split-Path $OmpExe
+New-Item -ItemType Directory -Force -Path $ompDir | Out-Null
+Get-VerifiedFile $ompAsset.browser_download_url $OmpExe $ompSha256 "omp $($release.tag_name) ($([math]::Round($ompAsset.size / 1MB)) МБ)"
+$userPath = [Environment]::GetEnvironmentVariable("Path", "User")
+if (-not (($userPath -split ";") -contains $ompDir)) {
+    [Environment]::SetEnvironmentVariable("Path", (($userPath.TrimEnd(";"), $ompDir) -join ";").TrimStart(";"), "User")
 }
 Update-SessionPath
-if (-not (Test-Path -LiteralPath $OmpExe)) {
-    Stop-WithError "omp не установился (нет файла $OmpExe)."
-}
 $ompVersion = Invoke-Native { & $OmpExe --version }
 Write-Ok "omp: $ompVersion"
 
