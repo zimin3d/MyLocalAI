@@ -226,7 +226,8 @@ if ($Provider.Id -eq "moonshot") {
 }
 Write-Ok "Ключ сохранён в $EnvFile"
 
-$commands = @("cd /d `"$VaultPath`"", "`"$OmpExe`" --model $($Provider.Id)/$model", "if errorlevel 1 pause")
+# `%` starts a variable reference in a batch file even within quotes.
+$commands = @("cd /d `"$($VaultPath.Replace('%', '%%'))`"", "`"$($OmpExe.Replace('%', '%%'))`" --model $($Provider.Id)/$model", "if errorlevel 1 pause")
 New-Launcher (Get-LauncherTitle $Provider) $commands "Помощник на облачной модели $($Provider.Name) ($model)" "$OmpExe,0"
 
 Write-Host ""

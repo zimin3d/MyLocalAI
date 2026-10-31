@@ -354,12 +354,18 @@ function New-DesktopShortcut([string]$Title, [string]$Target, [string]$WorkDir, 
     Write-Warn "Не удалось создать ярлык «$Title» (возможно, мешает антивирус). Запускайте: $Target"
 }
 
+# A path quoted for a .cmd line. Inside a batch file `%` starts a variable
+# reference even within quotes, so it is doubled; `"` cannot occur in paths.
+function ConvertTo-CmdArg([string]$Value) {
+    return '"' + $Value.Replace('%', '%%') + '"'
+}
+
 # Lines for a launcher that opens the assistant in the vault, optionally on a
 # given model; the window stays open if omp exits with an error.
 function Get-AssistantCommands([string]$ModelArg = "") {
-    $run = "`"$OmpExe`""
+    $run = ConvertTo-CmdArg $OmpExe
     if ($ModelArg) { $run += " --model $ModelArg" }
-    return @("cd /d `"$VaultPath`"", $run, "if errorlevel 1 pause")
+    return @("cd /d $(ConvertTo-CmdArg $VaultPath)", $run, "if errorlevel 1 pause")
 }
 
 # Path of OMP Desktop's main .exe from its uninstall entry (per-user or
@@ -667,7 +673,21 @@ if ($ompSha256 -notmatch "^[0-9a-fA-F]{64}$") {
 }
 $ompDir = Split-Path $OmpExe
 New-Item -ItemType Directory -Force -Path $ompDir | Out-Null
-Get-VerifiedFile $ompAsset.browser_download_url $OmpExe $ompSha256 "omp $($release.tag_name) ($([math]::Round($ompAsset.size / 1MB)) МБ)"
+$ompBusy = $false
+if ((Test-Path -LiteralPath $OmpExe) -and (Get-FileHash -Algorithm SHA256 -LiteralPath $OmpExe).Hash -ne $ompSha256) {
+    # An open assistant window (or OMP Desktop tab) keeps omp.exe locked; a
+    # replace would fail half-way, so keep the working old version instead.
+    try {
+        [System.IO.File]::Open($OmpExe, "Open", "ReadWrite", "None").Close()
+    } catch {
+        $ompBusy = $true
+        Write-Warn "omp сейчас запущен (открыто окно помощника) — обновление до $($release.tag_name) пропущено."
+        Write-Warn "Закройте все окна помощника и запустите УСТАНОВИТЬ.cmd ещё раз, чтобы обновить."
+    }
+}
+if (-not $ompBusy) {
+    Get-VerifiedFile $ompAsset.browser_download_url $OmpExe $ompSha256 "omp $($release.tag_name) ($([math]::Round($ompAsset.size / 1MB)) МБ)"
+}
 $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
 if (-not (($userPath -split ";") -contains $ompDir)) {
     [Environment]::SetEnvironmentVariable("Path", (($userPath.TrimEnd(";"), $ompDir) -join ";").TrimStart(";"), "User")
@@ -790,12 +810,18 @@ Write-Ok "omp подключён к локальным моделям ($MainMode
 
 # The guard lives in the user agent folder, outside the vault, so the agent
 # cannot rewrite it. The vault path is baked in as a JSON string literal.
-$hookDir = Join-Path $agentDir "hooks\pre"
-New-Item -ItemType Directory -Force -Path $hookDir | Out-Null
+# Named omp profiles (omp --profile, or a profile picked in OMP Desktop) use
+# their own agent folder under ~/.omp/profiles, so the guard goes there too.
 $vaultLiteral = ConvertTo-Json -InputObject ([string]$VaultPath) -Compress
 $guard = (Get-Content -LiteralPath $GuardFile -Raw -Encoding UTF8).Replace("__VAULT__", $vaultLiteral)
-[System.IO.File]::WriteAllText((Join-Path $hookDir "vault-guard.ts"), $guard, $Utf8NoBom)
+$guardDirs = @($agentDir) + @(Get-ChildItem -Path (Join-Path $env:USERPROFILE ".omp\profiles\*\agent") -Directory -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName })
+foreach ($dir in $guardDirs) {
+    $hookDir = Join-Path $dir "hooks\pre"
+    New-Item -ItemType Directory -Force -Path $hookDir | Out-Null
+    [System.IO.File]::WriteAllText((Join-Path $hookDir "vault-guard.ts"), $guard, $Utf8NoBom)
+}
 Write-Ok "Помощник ограничен папкой заметок: $VaultPath"
+if ($guardDirs.Count -gt 1) { Write-Ok "Ограничение поставлено и в профили omp: $($guardDirs.Count - 1)" }
 
 # ---------------------------------------------------------------- 5. vault
 
@@ -975,7 +1001,7 @@ if ($SkipImages) {
     # ComfyUI starts, or both will crawl.
     $stopModels = @($MainModel, $FastModel, $SmartModel, $UncensoredName) | Where-Object { $_ } | Select-Object -Unique
     $comfyCommands = @($stopModels | ForEach-Object { "ollama stop $_ >nul 2>&1" }) + @(
-        "cd /d `"$ComfyRoot`"",
+        "cd /d $(ConvertTo-CmdArg $ComfyRoot)",
         ".\python_embeded\python.exe -s ComfyUI\main.py --windows-standalone-build",
         "pause")
     Remove-Item -LiteralPath (Join-Path $ImagesPath "start-comfyui.ps1") -Force -ErrorAction SilentlyContinue
@@ -1006,7 +1032,7 @@ if ($uncensoredReady) {
     New-Launcher "Второй мозг — без цензуры (ИИ)" (Get-AssistantCommands "ollama/$UncensoredName") "Помощник на Qwen3.8 27B без цензуры: не отказывается отвечать" "$OmpExe,0"
 }
 if ($DesktopExe) {
-    New-Launcher "Второй мозг (окно)" @("start `"`" `"$DesktopExe`" `"$VaultPath`"") "Помощник в отдельном окне (OMP Desktop), открывает папку заметок" "$DesktopExe,0"
+    New-Launcher "Второй мозг (окно)" @("start `"`" $(ConvertTo-CmdArg $DesktopExe) $(ConvertTo-CmdArg $VaultPath)") "Помощник в отдельном окне (OMP Desktop), открывает папку заметок" "$DesktopExe,0"
 }
 New-DesktopShortcut "Заметки (Obsidian)" $ObsidianExe (Split-Path $ObsidianExe) "Ваши заметки"
 

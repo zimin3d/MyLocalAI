@@ -10,12 +10,21 @@
 //     resolve inside the vault (symlinks and junctions are followed);
 //   - inside the vault, hidden folders (.omp, .obsidian, …) and agent config
 //     files are read-only: writing there could plant hooks or MCP servers;
-//   - URLs are allowed only for reading public web pages;
+//   - URLs are allowed only for reading public web pages (the host must not
+//     resolve to a loopback or private address);
 //   - everything else (shell, code eval, subagents, browser, MCP, …) is refused.
+//
+// Paths are normalized the way omp's expandPath() does before it opens them
+// (stray leading ":" or "@", file:// URLs, \\?\ prefixes, "~name", Unicode
+// spaces, /c/... and /mnt/c/... drive aliases), so a prefix omp strips cannot
+// make an outside path look like a vault-relative one.
 
+import * as dns from "node:dns";
 import * as fs from "node:fs";
+import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
+import * as url from "node:url";
 
 const VAULT = __VAULT__;
 
@@ -40,6 +49,7 @@ const PROTECTED_NAMES = new Set(["agents.md", "claude.md", "gemini.md", "rules.m
 
 const GLOB_CHARS = /[*?[\]{}]/;
 const URL_SCHEME = /^[a-z][a-z0-9+.-]*:\/\//i;
+const UNICODE_SPACES = /[\u00A0\u2000-\u200A\u202F\u205F\u3000]/g;
 
 function fold(p: string): string {
 	return IS_WINDOWS ? p.toLowerCase() : p;
@@ -76,27 +86,65 @@ function isProtected(absolute: string): boolean {
 	return parts.some(part => part.startsWith(".")) || PROTECTED_NAMES.has((parts[parts.length - 1] ?? "").toLowerCase());
 }
 
-function isPublicWebUrl(value: string): boolean {
-	let url: URL;
+function isPrivateIp(ip: string): boolean {
+	if (net.isIPv4(ip)) {
+		const [a, b] = ip.split(".").map(Number);
+		return a === 0 || a === 10 || a === 127 || a >= 224 ||
+			(a === 192 && b === 168) || (a === 172 && b >= 16 && b <= 31) ||
+			(a === 169 && b === 254) || (a === 100 && b >= 64 && b <= 127);
+	}
+	const v6 = ip.toLowerCase();
+	const mapped = /^::ffff:(\d+\.\d+\.\d+\.\d+)$/.exec(v6);
+	if (mapped) return isPrivateIp(mapped[1]);
+	return v6 === "::" || v6 === "::1" || v6.startsWith("fe8") || v6.startsWith("fe9") ||
+		v6.startsWith("fea") || v6.startsWith("feb") || v6.startsWith("fc") || v6.startsWith("fd") ||
+		v6.startsWith("::ffff:");
+}
+
+// The host of a readable public web URL, or undefined when the URL is not one.
+// DNS is checked separately (see the handler): a public-looking name can still
+// point at 127.0.0.1 or the home network.
+function publicWebHost(value: string): string | undefined {
+	let parsed: URL;
 	try {
-		url = new URL(value);
+		parsed = new URL(value);
 	} catch {
-		return false;
+		return undefined;
 	}
-	if (url.protocol !== "http:" && url.protocol !== "https:") return false;
-	let host = url.hostname.toLowerCase();
-	if (host.startsWith("[")) return false; // IPv6 literals: not worth the risk
-	if (!host.includes(".") || /\.(local|localhost|internal|lan|home)$/.test(host)) return false;
-	const v4 = /^(\d+)\.(\d+)\.(\d+)\.(\d+)$/.exec(host);
-	if (v4) {
-		const [a, b] = [Number(v4[1]), Number(v4[2])];
-		if (a === 0 || a === 10 || a === 127 || a >= 224) return false;
-		if (a === 192 && b === 168) return false;
-		if (a === 172 && b >= 16 && b <= 31) return false;
-		if (a === 169 && b === 254) return false;
-		if (a === 100 && b >= 64 && b <= 127) return false;
+	if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return undefined;
+	const host = parsed.hostname.toLowerCase().replace(/\.+$/, "");
+	if (host.startsWith("[") || net.isIPv6(host)) return undefined; // IPv6 literals: not worth the risk
+	if (!host.includes(".") || /\.(local|localhost|internal|lan|home|arpa)$/.test(host)) return undefined;
+	if (net.isIPv4(host) && isPrivateIp(host)) return undefined;
+	return host;
+}
+
+// Mirrors omp's expandPath() + Windows drive-alias mapping, so the guard
+// judges the same path omp will open.
+function ompExpand(value: string): string {
+	let v = value;
+	if (/^:(?=[/\\~]|\.\.?[/\\]|[A-Za-z]:)/.test(v)) v = v.slice(1);
+	if (v.startsWith("@")) {
+		const rest = v.slice(1);
+		if (rest.startsWith("/") || rest.startsWith("~") || path.win32.isAbsolute(rest) || URL_SCHEME.test(rest)) v = rest;
 	}
-	return true;
+	v = v.replace(UNICODE_SPACES, " ");
+	if (v.toLowerCase().startsWith("file://")) {
+		try {
+			v = url.fileURLToPath(v);
+		} catch {
+			// left as is; it is then judged as a URL and refused
+		}
+	}
+	if (/^\\\\\?\\UNC\\/i.test(v)) v = "\\\\" + v.slice(8);
+	else if (/^\\\\[?.]\\/.test(v)) v = v.slice(4);
+	if (v === "~") v = os.homedir();
+	else if (v.startsWith("~")) v = P.join(os.homedir(), v.slice(1));
+	if (IS_WINDOWS) {
+		const alias = /^\/(?:mnt\/)?([A-Za-z])(?:\/(.*))?$/.exec(v);
+		if (alias) v = `${alias[1].toUpperCase()}:\\${(alias[2] ?? "").split("/").filter(Boolean).join("\\")}`;
+	}
+	return v;
 }
 
 // The folder a glob actually walks: everything before the first wildcard segment.
@@ -109,9 +157,8 @@ function globBase(value: string): string {
 }
 
 function toAbsolute(value: string, cwd: string): string {
-	let v = value.trim();
-	if (v === "/" || v === "\\") return P.resolve(cwd); // omp treats a bare slash as the session folder
-	if (v === "~" || v.startsWith("~/") || v.startsWith("~\\")) v = P.join(os.homedir(), v.slice(1));
+	const v = ompExpand(value.trim());
+	if (/^[/\\]+$/.test(v)) return P.resolve(cwd); // omp treats a bare slash as the session folder
 	return P.resolve(cwd, v);
 }
 
@@ -123,10 +170,21 @@ function candidates(value: string, cwd: string): string[] {
 	const add = (v: string) => {
 		const t = v.trim();
 		if (!t) return;
-		out.add(t);
-		out.add(globBase(t));
-		const selector = /^(.*[^:\\/]):[^:\\/]*$/.exec(t);
-		if (selector && !/^[a-z]$/i.test(selector[1])) out.add(selector[1]);
+		// Judge both the raw text and what omp's normalization turns it into.
+		for (const form of new Set([t, ompExpand(t)])) {
+			out.add(form);
+			out.add(globBase(form));
+			const selector = /^(.*[^:\\/]):[^:\\/]*$/.exec(form);
+			if (selector && !/^[a-z]$/i.test(selector[1])) out.add(selector[1]);
+			// Brace alternatives ({a,b}) are judged one by one, so "{../x,y}" cannot hide "../x".
+			for (const alt of form.match(/\{[^{}]*\}/g) ?? []) {
+				for (const part of alt.slice(1, -1).split(",")) {
+					const expanded = form.replace(alt, part);
+					out.add(expanded);
+					out.add(globBase(expanded));
+				}
+			}
+		}
 	};
 	for (const entry of value.split(";")) {
 		add(entry);
@@ -165,35 +223,65 @@ function patchPaths(input: Record<string, unknown>): string[] {
 	return out;
 }
 
-function check(toolName: string, input: Record<string, unknown>, cwd: string): string | undefined {
+interface Verdict {
+	reason?: string;
+	/** Hosts of public URLs the call reads; their DNS answers still need checking. */
+	hosts: string[];
+}
+
+function check(toolName: string, input: Record<string, unknown>, cwd: string): Verdict {
+	const deny = (reason: string): Verdict => ({ reason, hosts: [] });
+	const hosts: string[] = [];
 	const tool = toolName.toLowerCase();
-	if (PATHLESS_TOOLS.has(tool)) return undefined;
+	if (PATHLESS_TOOLS.has(tool)) return { hosts };
 	const writes = WRITE_TOOLS.has(tool);
 	if (!writes && !READ_TOOLS.has(tool)) {
-		return `инструмент «${toolName}» отключён: помощник работает только с заметками`;
+		return deny(`инструмент «${toolName}» отключён: помощник работает только с заметками`);
 	}
 
 	const raw: string[] = [];
 	collectPaths(input, raw);
 	if (tool === "edit") raw.push(...patchPaths(input));
 	if (raw.length === 0) {
-		if (writes) return "не удалось определить, какой файл меняется";
+		if (writes) return deny("не удалось определить, какой файл меняется");
 		raw.push("."); // search tools default to the session folder
 	}
 
 	for (const value of raw) {
 		for (const candidate of candidates(value, cwd)) {
 			if (URL_SCHEME.test(candidate)) {
-				if (!writes && isPublicWebUrl(candidate)) continue;
-				return `адрес «${candidate}» недоступен: разрешены только файлы в папке заметок и публичные сайты`;
+				const host = writes ? undefined : publicWebHost(candidate);
+				if (host) {
+					hosts.push(host);
+					continue;
+				}
+				return deny(`адрес «${candidate}» недоступен: разрешены только файлы в папке заметок и публичные сайты`);
 			}
 			const absolute = toAbsolute(candidate, cwd);
 			if (!insideVault(absolute)) {
-				return `путь «${candidate}» вне папки заметок (${VAULT})`;
+				return deny(`путь «${candidate}» вне папки заметок (${VAULT})`);
 			}
 			if (writes && isProtected(absolute)) {
-				return `«${candidate}» — служебный файл, его менять нельзя`;
+				return deny(`«${candidate}» — служебный файл, его менять нельзя`);
 			}
+		}
+	}
+	return { hosts };
+}
+
+// Refuses a host whose DNS answer includes a loopback or private address, so a
+// name like "127.0.0.1.nip.io" cannot reach Ollama, ComfyUI or the router.
+// A failed lookup is refused too.
+async function privateHostReason(hosts: string[]): Promise<string | undefined> {
+	for (const host of new Set(hosts)) {
+		let addresses: { address: string }[];
+		try {
+			addresses = net.isIP(host) ? [{ address: host }] : await dns.promises.lookup(host, { all: true });
+		} catch {
+			return `не удалось проверить адрес сайта «${host}»`;
+		}
+		if (addresses.some(a => isPrivateIp(a.address))) {
+			return `сайт «${host}» ведёт на этот компьютер или домашнюю сеть`;
 		}
 	}
 	return undefined;
@@ -202,9 +290,10 @@ function check(toolName: string, input: Record<string, unknown>, cwd: string): s
 export default function vaultGuard(pi: any): void {
 	pi.on("tool_call", async (event: any, ctx: any) => {
 		const cwd = typeof ctx?.cwd === "string" && ctx.cwd ? ctx.cwd : process.cwd();
-		const reason = check(String(event?.toolName ?? ""), (event?.input ?? {}) as Record<string, unknown>, cwd);
+		const verdict = check(String(event?.toolName ?? ""), (event?.input ?? {}) as Record<string, unknown>, cwd);
+		const reason = verdict.reason ?? (await privateHostReason(verdict.hosts));
 		if (reason) return { block: true, reason: `Заблокировано: ${reason}.` };
 	});
 }
 
-export { check as _checkForTests };
+export { check as _checkForTests, privateHostReason as _privateHostReasonForTests };
