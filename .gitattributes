@@ -1,0 +1,7 @@
+# Windows files ship byte-for-byte: CRLF line endings and the UTF-8 BOM in
+# setup.ps1 are required by Windows PowerShell 5.1 and cmd.exe.
+*.ps1  -text
+*.cmd  -text
+*.txt  -text
+*.json -text
+*.md   text eol=lf
