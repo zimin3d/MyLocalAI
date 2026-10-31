@@ -13,13 +13,15 @@
 #    7. Кладёт ярлыки на рабочий стол и проверяет, что модель работает на видеокарте
 #
 #  Запуск: двойной клик по "УСТАНОВИТЬ.cmd" (лежит рядом).
+#  В начале скрипт спросит, на какой диск сохранить модели и ComfyUI.
 #  Параметры (для опытных):
+#    -InstallRoot "D:\MyLocalAI"  папка для моделей, ComfyUI и заметок (без вопроса о диске)
 #    -VaultPath "D:\Заметки"   своё место для заметок
 #    -SkipModels               не скачивать модели
 #    -MainModel / -FastModel   другие модели Ollama
 #    -SmartModel ""            не ставить модель для «умного режима»
 #    -SkipImages               не ставить генерацию картинок (~20 ГБ)
-#    -ImagesPath "D:\AI"       куда ставить ComfyUI (по умолчанию C:\AI)
+#    -ImagesPath "D:\AI"       куда ставить ComfyUI (по умолчанию — папка установки)
 # =====================================================================
 
 param(
@@ -30,7 +32,8 @@ param(
     [int]$ContextLength = 32768,
     [switch]$SkipModels,
     [switch]$SkipImages,
-    [string]$ImagesPath = ""
+    [string]$ImagesPath = "",
+    [string]$InstallRoot = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -63,14 +66,6 @@ $WorkflowFile = Join-Path $PSScriptRoot "qwen-image-2.1-uncensored.json"
 $GuardFile = Join-Path $PSScriptRoot "vault-guard.ts"
 $SevenZipExe = Join-Path $env:ProgramFiles "7-Zip\7z.exe"
 
-if (-not $ImagesPath) {
-    $ImagesPath = Join-Path $env:SystemDrive "AI"
-}
-$ComfyRoot = Join-Path $ImagesPath "ComfyUI_windows_portable"
-
-if (-not $VaultPath) {
-    $VaultPath = Join-Path ([Environment]::GetFolderPath("MyDocuments")) "Второй мозг"
-}
 
 # ---------------------------------------------------------------- helpers
 
@@ -187,6 +182,54 @@ function Get-VerifiedFile([string]$Url, [string]$Path, [string]$Sha256, [string]
     Write-Ok "$Title скачан и проверен"
 }
 
+# Lists local fixed disks and lets the user pick one by number; Enter picks
+# the disk with the most free space. Disks without room for the data (plus the
+# programs, on the system disk) are shown but refused.
+function Select-InstallDrive([int]$NeededGb, [int]$ProgramsGb) {
+    $disks = @(Get-CimInstance Win32_LogicalDisk -Filter "DriveType=3" | Sort-Object DeviceID)
+    if ($disks.Count -le 1) { return $env:SystemDrive }
+    $best = $disks | Sort-Object FreeSpace -Descending | Select-Object -First 1
+    # No disk fits: return the roomiest one and let the space check explain.
+    if (-not ($disks | Where-Object { Test-DriveFits $_ $NeededGb $ProgramsGb })) { return $best.DeviceID }
+    Write-Host ""
+    Write-Host "    Куда сохранить модели и программу для картинок (нужно ~$NeededGb ГБ)?" -ForegroundColor White
+    for ($i = 0; $i -lt $disks.Count; $i++) {
+        $d = $disks[$i]
+        $free = [math]::Round($d.FreeSpace / 1GB)
+        $total = [math]::Round($d.Size / 1GB)
+        $label = if ($d.VolumeName) { " ($($d.VolumeName))" } else { "" }
+        $mark = if ($d.DeviceID -eq $best.DeviceID) { "   ← больше всего места" } else { "" }
+        if (-not (Test-DriveFits $d $NeededGb $ProgramsGb)) { $mark = "   (мало места)" }
+        Write-Host ("      {0}) {1}{2}  свободно {3} ГБ из {4} ГБ{5}" -f ($i + 1), $d.DeviceID, $label, $free, $total, $mark)
+    }
+    for (;;) {
+        $answer = Read-Host "    Введите номер диска и нажмите Enter (просто Enter — диск $($best.DeviceID))"
+        $n = 0
+        $picked = $null
+        if (-not $answer.Trim()) {
+            $picked = $best
+        } elseif ([int]::TryParse($answer.Trim(), [ref]$n) -and $n -ge 1 -and $n -le $disks.Count) {
+            $picked = $disks[$n - 1]
+        } else {
+            Write-Warn "Нет такого номера, попробуйте ещё раз."
+            continue
+        }
+        if (Test-DriveFits $picked $NeededGb $ProgramsGb) { return $picked.DeviceID }
+        Write-Warn "На диске $($picked.DeviceID) мало места, выберите другой."
+    }
+}
+
+function Test-DriveFits($Disk, [int]$NeededGb, [int]$ProgramsGb) {
+    $need = $NeededGb
+    if ($Disk.DeviceID -eq $env:SystemDrive) { $need += $ProgramsGb }
+    return ($Disk.FreeSpace / 1GB) -ge $need
+}
+
+function Get-FreeGb([string]$Path) {
+    $drive = Get-PSDrive -Name ((Split-Path -Qualifier $Path).TrimEnd(":"))
+    return [math]::Round($drive.Free / 1GB)
+}
+
 function Restart-Ollama {
     Get-Process -Name "ollama app", "ollama" -ErrorAction SilentlyContinue | Stop-Process -Force
     Start-Sleep -Seconds 2
@@ -232,15 +275,54 @@ if (-not $SkipImages -and -not (Test-Path -LiteralPath $WorkflowFile)) {
     Stop-WithError "Рядом со скриптом нет файла qwen-image-2.1-uncensored.json. Скопируйте папку установки целиком."
 }
 
-$systemDrive = Get-PSDrive -Name ($env:SystemDrive.TrimEnd(":"))
-$freeGb = [math]::Round($systemDrive.Free / 1GB)
-$neededGb = 20
-if ($SmartModel) { $neededGb += 10 }
-if (-not $SkipImages) { $neededGb += 30 }
-if ($freeGb -lt $neededGb) {
-    Stop-WithError "На диске $($env:SystemDrive) свободно $freeGb ГБ, а нужно хотя бы $neededGb ГБ."
+# Programs (Git, Ollama, Obsidian, omp) always go to the system disk; the
+# heavy parts — Ollama models, ComfyUI and its models — go to the chosen one.
+$programsGb = 5
+$dataGb = 20
+if ($SmartModel) { $dataGb += 10 }
+if (-not $SkipImages) { $dataGb += 30 }
+
+if (-not $InstallRoot) {
+    $drive = Select-InstallDrive $dataGb $programsGb
+    if ($drive -ne $env:SystemDrive) { $InstallRoot = "$drive\MyLocalAI" }
 }
-Write-Ok "Свободно на диске: $freeGb ГБ"
+if ($InstallRoot) {
+    if (-not (Test-Path -LiteralPath (Split-Path -Qualifier $InstallRoot))) {
+        Stop-WithError "Диск $(Split-Path -Qualifier $InstallRoot) не найден."
+    }
+    $InstallRoot = [System.IO.Path]::GetFullPath($InstallRoot)
+    New-Item -ItemType Directory -Force -Path $InstallRoot | Out-Null
+    $OllamaModelsDir = Join-Path $InstallRoot "ollama-models"
+    if (-not $ImagesPath) { $ImagesPath = $InstallRoot }
+    if (-not $VaultPath) { $VaultPath = Join-Path $InstallRoot "Второй мозг" }
+} else {
+    $OllamaModelsDir = ""
+    if (-not $ImagesPath) { $ImagesPath = Join-Path $env:SystemDrive "AI" }
+}
+if (-not $VaultPath) {
+    $VaultPath = Join-Path ([Environment]::GetFolderPath("MyDocuments")) "Второй мозг"
+}
+$ComfyRoot = Join-Path $ImagesPath "ComfyUI_windows_portable"
+
+$dataDrive = Split-Path -Qualifier $(if ($InstallRoot) { $InstallRoot } else { $env:SystemDrive + "\" })
+$systemFree = Get-FreeGb ($env:SystemDrive + "\")
+if ($dataDrive -eq $env:SystemDrive) {
+    if ($systemFree -lt $programsGb + $dataGb) {
+        Stop-WithError "На диске $($env:SystemDrive) свободно $systemFree ГБ, а нужно хотя бы $($programsGb + $dataGb) ГБ. Запустите установку снова и выберите другой диск."
+    }
+    Write-Ok "Всё ставится на диск $($env:SystemDrive) (свободно $systemFree ГБ)"
+} else {
+    $dataFree = Get-FreeGb $InstallRoot
+    if ($dataFree -lt $dataGb) {
+        Stop-WithError "На диске $dataDrive свободно $dataFree ГБ, а нужно хотя бы $dataGb ГБ."
+    }
+    if ($systemFree -lt $programsGb) {
+        Stop-WithError "На диске $($env:SystemDrive) свободно $systemFree ГБ, а для программ нужно хотя бы $programsGb ГБ."
+    }
+    Write-Ok "Модели и картинки: $InstallRoot (свободно $dataFree ГБ)"
+    Write-Ok "Программы: диск $($env:SystemDrive) (~$programsGb ГБ, свободно $systemFree ГБ)"
+}
+Write-Ok "Заметки: $VaultPath"
 
 $ramGb = [math]::Round((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1GB)
 Write-Ok "Оперативная память: $ramGb ГБ"
@@ -302,11 +384,16 @@ $ollamaEnv = [ordered]@{
     "OLLAMA_KV_CACHE_TYPE"   = "q8_0"
     "OLLAMA_KEEP_ALIVE"      = "30m"
 }
+if ($OllamaModelsDir) {
+    New-Item -ItemType Directory -Force -Path $OllamaModelsDir | Out-Null
+    $ollamaEnv["OLLAMA_MODELS"] = $OllamaModelsDir
+}
 foreach ($name in $ollamaEnv.Keys) {
     [Environment]::SetEnvironmentVariable($name, $ollamaEnv[$name], "User")
     Set-Item -Path "Env:$name" -Value $ollamaEnv[$name]
 }
 Write-Ok "Контекст $ContextLength токенов, экономный режим памяти"
+if ($OllamaModelsDir) { Write-Ok "Модели Ollama хранятся в $OllamaModelsDir" }
 
 Restart-Ollama
 Write-Ok "Ollama запущена"
@@ -704,6 +791,9 @@ Write-Host "Заметки появятся в папке: $VaultPath"
 if ($imagesReady) {
     Write-Host "Картинки: ярлык «Картинки (ComfyUI)» → слева «Рабочие процессы» → «Qwen-Image uncensored»."
     Write-Host "Готовые картинки сохраняются в: $(Join-Path $ComfyRoot 'ComfyUI\output')"
+}
+if ($OllamaModelsDir) {
+    Write-Host "Модели ИИ лежат в: $OllamaModelsDir"
 }
 Write-Host "Журнал установки: $LogFile"
 
