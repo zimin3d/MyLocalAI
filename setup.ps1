@@ -5,7 +5,8 @@
 #    1. Проверяет видеокарту NVIDIA и драйвер
 #    2. Ставит Git (нужен omp для команд), Ollama (локальные модели), Obsidian (заметки)
 #    3. Настраивает Ollama под 12 ГБ видеопамяти и скачивает модели:
-#       qwen3.5:9b (основная), qwen3.5:4b (быстрая), bonsai-2:27b («умный режим»)
+#       qwen3.5:9b (основная), qwen3.5:4b (быстрая), bonsai-2:27b («умный режим»),
+#       Qwen3.8 27B abliterated («без цензуры»)
 #    4. Ставит Oh My Pi (omp), подключает его к локальным моделям и запирает
 #       в папке заметок (хук vault-guard.ts: файлы вне папки, команды и код недоступны)
 #    5. Создаёт хранилище заметок "Второй мозг" с инструкцией для ИИ
@@ -20,6 +21,7 @@
 #    -SkipModels               не скачивать модели
 #    -MainModel / -FastModel   другие модели Ollama
 #    -SmartModel ""            не ставить модель для «умного режима»
+#    -UncensoredModel ""       не ставить модель «без цензуры»
 #    -SkipImages               не ставить генерацию картинок (~20 ГБ)
 #    -ImagesPath "D:\AI"       куда ставить ComfyUI (по умолчанию — папка установки)
 # =====================================================================
@@ -29,6 +31,7 @@ param(
     [string]$MainModel = "qwen3.5:9b",
     [string]$FastModel = "qwen3.5:4b",
     [string]$SmartModel = "bonsai-2:27b",
+    [string]$UncensoredModel = "hf.co/huihui-ai/Huihui-Qwen3.8-27B-abliterated-GGUF:UD-IQ2_S",
     [int]$ContextLength = 32768,
     [switch]$SkipModels,
     [switch]$SkipImages,
@@ -47,6 +50,12 @@ $OllamaUrl = "http://127.0.0.1:11434"
 $OmpExe = Join-Path $env:LOCALAPPDATA "omp\omp.exe"
 $ObsidianExe = Join-Path $env:LOCALAPPDATA "Programs\Obsidian\Obsidian.exe"
 $Utf8NoBom = New-Object System.Text.UTF8Encoding $false
+
+# The uncensored GGUF on Hugging Face ships no chat template, so Ollama would
+# not format tool calls; it is rebuilt under this name with the renderer and
+# parser of the official qwen3.8 model (needs Ollama 0.32.12+).
+$UncensoredName = "qwen3.8-uncensored:27b"
+$UncensoredMinOllama = [version]"0.32.12"
 
 # Image generation: ComfyUI portable + Qwen-Image 2.1 Uncensored. Versions and
 # checksums are pinned so a re-run downloads exactly the files tested here.
@@ -253,9 +262,9 @@ Write-Host "=================================================================" -
 Write-Host "   Установка «Второго мозга»: Oh My Pi + локальный ИИ + Obsidian" -ForegroundColor Magenta
 Write-Host "=================================================================" -ForegroundColor Magenta
 if ($SkipImages) {
-    Write-Host "Это займёт 20–60 минут (в основном скачивание моделей, ~20 ГБ)."
+    Write-Host "Это займёт 20–60 минут (в основном скачивание моделей, ~30 ГБ)."
 } else {
-    Write-Host "Это займёт 40–120 минут (в основном скачивание моделей, ~40 ГБ)."
+    Write-Host "Это займёт 40–120 минут (в основном скачивание моделей, ~50 ГБ)."
 }
 Write-Host "Не закрывайте это окно до сообщения «ГОТОВО»."
 
@@ -309,7 +318,8 @@ if ($vramGb -gt 0 -and $vramGb -lt 11) {
     Write-Warn "Видеопамяти $vramGb ГБ — включаю облегчённый режим (рассчитано на 12 ГБ):"
     if (-not $PSBoundParameters.ContainsKey("MainModel")) { $MainModel = "qwen3.5:4b" }
     if (-not $PSBoundParameters.ContainsKey("SmartModel")) { $SmartModel = "" }
-    Write-Warn "  основная модель $MainModel, «умный режим» не ставится."
+    if (-not $PSBoundParameters.ContainsKey("UncensoredModel")) { $UncensoredModel = "" }
+    Write-Warn "  основная модель $MainModel, «умный режим» и модель «без цензуры» не ставятся."
     if ($vramGb -lt 7) {
         if (-not $PSBoundParameters.ContainsKey("SkipImages")) { $SkipImages = $true }
         if ($SkipImages) { Write-Warn "  генерация картинок не ставится: ей нужно хотя бы 8 ГБ видеопамяти." }
@@ -323,6 +333,7 @@ if ($vramGb -gt 0 -and $vramGb -lt 11) {
 $programsGb = 5
 $dataGb = 20
 if ($SmartModel) { $dataGb += 10 }
+if ($UncensoredModel) { $dataGb += 10 }
 if (-not $SkipImages) { $dataGb += 30 }
 
 if (-not $InstallRoot) {
@@ -442,6 +453,50 @@ if ($SmartModel -and -not $SkipModels) {
     } else {
         Write-Warn "Не удалось скачать $SmartModel — «умный режим» пропущен, остальное работает."
         Write-Warn "Позже можно докачать: запустите УСТАНОВИТЬ.cmd ещё раз."
+    }
+}
+
+# Optional as well. Pulled from Hugging Face, then re-created under a short
+# name with a Modelfile that adds the chat template; the hf.co tag is removed
+# afterwards (the weights stay, shared by the new name).
+$uncensoredReady = $false
+if ($UncensoredModel -and -not $SkipModels) {
+    $ollamaVersion = $null
+    try {
+        $raw = (Invoke-RestMethod -Uri "$OllamaUrl/api/version" -TimeoutSec 5).version
+        $ollamaVersion = [version](($raw -split "[-+]")[0])
+    } catch { }
+    if ($ollamaVersion -and $ollamaVersion -lt $UncensoredMinOllama) {
+        Write-Warn "Ollama $ollamaVersion слишком старая для модели «без цензуры» (нужна $UncensoredMinOllama+) — пропускаю."
+        Write-Warn "Обновите Ollama (winget upgrade Ollama.Ollama) и запустите УСТАНОВИТЬ.cmd ещё раз."
+    } else {
+        Write-Info "Скачиваю модель «без цензуры» Qwen3.8 27B (~9 ГБ)..."
+        Invoke-Native { ollama pull $UncensoredModel }
+        if ($LASTEXITCODE -eq 0) {
+            $modelfile = Join-Path $env:TEMP "qwen3.8-uncensored.Modelfile"
+            $modelfileText = @'
+FROM __SOURCE__
+RENDERER qwen3.8
+PARSER qwen3.5
+PARAMETER temperature 1
+PARAMETER top_k 20
+PARAMETER top_p 0.95
+PARAMETER min_p 0
+'@
+            [System.IO.File]::WriteAllText($modelfile, $modelfileText.Replace("__SOURCE__", $UncensoredModel), $Utf8NoBom)
+            Invoke-Native { ollama create $UncensoredName -f $modelfile }
+            if ($LASTEXITCODE -eq 0) {
+                Invoke-Native { ollama rm $UncensoredModel | Out-Null }
+                $uncensoredReady = $true
+                Write-Ok "Модель «без цензуры» готова: $UncensoredName"
+            } else {
+                Write-Warn "Не удалось подготовить модель «без цензуры» — пропускаю, остальное работает."
+            }
+            Remove-Item -LiteralPath $modelfile -Force -ErrorAction SilentlyContinue
+        } else {
+            Write-Warn "Не удалось скачать модель «без цензуры» — пропускаю, остальное работает."
+            Write-Warn "Позже можно докачать: запустите УСТАНОВИТЬ.cmd ещё раз."
+        }
     }
 }
 
@@ -785,6 +840,17 @@ if ($smartReady) {
     Write-Ok "Ярлык «Второй мозг — умный режим (ИИ)» на рабочем столе"
 }
 
+if ($uncensoredReady) {
+    $free = $shell.CreateShortcut((Join-Path $desktop "Второй мозг — без цензуры (ИИ).lnk"))
+    $free.TargetPath = Join-Path $env:SystemRoot "System32\cmd.exe"
+    $free.Arguments = "/k cd /d `"$VaultPath`" && `"$OmpExe`" --model ollama/$UncensoredName"
+    $free.WorkingDirectory = $VaultPath
+    $free.IconLocation = "$OmpExe,0"
+    $free.Description = "Помощник на Qwen3.8 27B без цензуры: не отказывается отвечать"
+    $free.Save()
+    Write-Ok "Ярлык «Второй мозг — без цензуры (ИИ)» на рабочем столе"
+}
+
 $notes = $shell.CreateShortcut((Join-Path $desktop "Заметки (Obsidian).lnk"))
 $notes.TargetPath = $ObsidianExe
 $notes.WorkingDirectory = Split-Path $ObsidianExe
@@ -797,6 +863,9 @@ if (-not $SkipModels) {
 if ($smartReady) {
     Test-ModelOnGpu $SmartModel
 }
+if ($uncensoredReady) {
+    Test-ModelOnGpu $UncensoredName
+}
 
 Write-Host ""
 Write-Host "=================================================================" -ForegroundColor Green
@@ -806,6 +875,9 @@ Write-Host "Откройте на рабочем столе ярлык «Вто�
 Write-Host "    Запиши: купить подарок Ане до пятницы" -ForegroundColor White
 if ($smartReady) {
     Write-Host "Для сложных вопросов есть ярлык «Второй мозг — умный режим (ИИ)» — умнее, но отвечает медленнее."
+}
+if ($uncensoredReady) {
+    Write-Host "Ярлык «Второй мозг — без цензуры (ИИ)» — модель, которая не отказывается отвечать на острые темы."
 }
 Write-Host "Заметки появятся в папке: $VaultPath"
 if ($imagesReady) {
