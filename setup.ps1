@@ -25,6 +25,7 @@
 #    -SkipImages               не ставить генерацию картинок (~20 ГБ)
 #    -SkipDesktop              не ставить окно OMP Desktop (останется только терминал)
 #    -ImagesPath "D:\AI"       куда ставить ComfyUI (по умолчанию — папка установки)
+#    -ComfyListen "127.0.0.1"  адрес для ComfyUI (по умолчанию 0.0.0.0 — доступ по локальной сети)
 # =====================================================================
 
 param(
@@ -38,7 +39,8 @@ param(
     [switch]$SkipImages,
     [switch]$SkipDesktop,
     [string]$ImagesPath = "",
-    [string]$InstallRoot = ""
+    [string]$InstallRoot = "",
+    [string]$ComfyListen = "0.0.0.0"
 )
 
 $ErrorActionPreference = "Stop"
@@ -1000,12 +1002,28 @@ if ($SkipImages) {
     # The assistant's models stay in VRAM for 30 minutes; free the card before
     # ComfyUI starts, or both will crawl.
     $stopModels = @($MainModel, $FastModel, $SmartModel, $UncensoredName) | Where-Object { $_ } | Select-Object -Unique
+    $comfyArgs = "--windows-standalone-build"
+    if ($ComfyListen) {
+        $comfyArgs += " --listen $ComfyListen"
+    }
     $comfyCommands = @($stopModels | ForEach-Object { "ollama stop $_ >nul 2>&1" }) + @(
         "cd /d $(ConvertTo-CmdArg $ComfyRoot)",
-        ".\python_embeded\python.exe -s ComfyUI\main.py --windows-standalone-build",
+        ".\python_embeded\python.exe -s ComfyUI\main.py $comfyArgs",
         "pause")
     Remove-Item -LiteralPath (Join-Path $ImagesPath "start-comfyui.ps1") -Force -ErrorAction SilentlyContinue
     New-Launcher "Картинки (ComfyUI)" $comfyCommands "Генерация картинок Qwen-Image 2.1 (откроется в браузере)" ((Join-Path $ComfyRoot "python_embeded\python.exe") + ",0")
+
+    if ($ComfyListen -and $ComfyListen -ne "127.0.0.1" -and $ComfyListen -ne "localhost") {
+        try {
+            $fwRule = Get-NetFirewallRule -DisplayName "ComfyUI LAN 8188" -ErrorAction SilentlyContinue
+            if (-not $fwRule) {
+                New-NetFirewallRule -DisplayName "ComfyUI LAN 8188" -Direction Inbound -Protocol TCP -LocalPort 8188 -Action Allow -Profile Private -ErrorAction Stop | Out-Null
+                Write-Ok "Открыт порт 8188 в брандмауэре Windows для домашней (Private) сети"
+            }
+        } catch {
+            Write-Warn "Не удалось автоматически добавить правило брандмауэра для порта 8188 (нужны права администратора). При первом запуске ComfyUI разрешите доступ в частных сетях в окне Windows Defender."
+        }
+    }
 
     Write-Info "Проверяю, что ComfyUI видит видеокарту..."
     $torchCheck = Invoke-Native {
@@ -1066,6 +1084,14 @@ Write-Host "Заметки появятся в папке: $VaultPath"
 if ($imagesReady) {
     Write-Host "Картинки: ярлык «Картинки (ComfyUI)» → слева «Рабочие процессы» → «Qwen-Image uncensored»."
     Write-Host "Готовые картинки сохраняются в: $(Join-Path $ComfyRoot 'ComfyUI\output')"
+    if ($ComfyListen -and $ComfyListen -ne "127.0.0.1" -and $ComfyListen -ne "localhost") {
+        $lanIps = Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+            Where-Object { $_.IPAddress -like '192.168.*' -or $_.IPAddress -like '10.*' -or $_.IPAddress -match '^172\.(1[6-9]|2[0-9]|3[0-1])\.' } |
+            Select-Object -ExpandProperty IPAddress -Unique
+        foreach ($ip in $lanIps) {
+            Write-Host "Доступ к ComfyUI по локальной сети: http://${ip}:8188" -ForegroundColor Cyan
+        }
+    }
 }
 if ($OllamaModelsDir) {
     Write-Host "Модели ИИ лежат в: $OllamaModelsDir"
