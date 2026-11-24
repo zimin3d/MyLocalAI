@@ -228,37 +228,49 @@ function Get-VerifiedFile([string]$Url, [string]$Path, [string]$Sha256, [string]
 # Lists local fixed disks and lets the user pick one by number; Enter picks
 # the disk with the most free space. Disks without room for the data (plus the
 # programs, on the system disk) are shown but refused.
+function Test-ExistingInstall([string]$DriveId) {
+    if ($DriveId -eq $env:SystemDrive) {
+        return (Test-Path -LiteralPath (Join-Path "$DriveId\AI" "ComfyUI_windows_portable\ComfyUI\main.py")) -or
+               (Test-Path -LiteralPath (Join-Path "$DriveId\MyLocalAI" "ComfyUI_windows_portable\ComfyUI\main.py")) -or
+               (Test-Path -LiteralPath (Join-Path $env:LOCALAPPDATA "MyLocalAI"))
+    }
+    return (Test-Path -LiteralPath "$DriveId\MyLocalAI")
+}
+
 function Select-InstallDrive([int]$NeededGb, [int]$ProgramsGb) {
     $disks = @(Get-CimInstance Win32_LogicalDisk -Filter "DriveType=3" | Sort-Object DeviceID)
     if ($disks.Count -le 1) { return $env:SystemDrive }
-    $best = $disks | Sort-Object FreeSpace -Descending | Select-Object -First 1
-    # No disk fits: return the roomiest one and let the space check explain.
-    if (-not ($disks | Where-Object { Test-DriveFits $_ $NeededGb $ProgramsGb })) { return $best.DeviceID }
+    $existing = $disks | Where-Object { Test-ExistingInstall $_.DeviceID } | Select-Object -First 1
+    $best = if ($existing) { $existing } else { $disks | Sort-Object FreeSpace -Descending | Select-Object -First 1 }
     Write-Host ""
-    Write-Host "    Куда сохранить модели и программу для картинок (нужно ~$NeededGb ГБ)?" -ForegroundColor White
+    Write-Host "    Куда сохранить (или обновить) модели и ComfyUI (для чистой установки нужно ~$NeededGb ГБ)?" -ForegroundColor White
     for ($i = 0; $i -lt $disks.Count; $i++) {
         $d = $disks[$i]
         $free = [math]::Round($d.FreeSpace / 1GB)
         $total = [math]::Round($d.Size / 1GB)
         $label = if ($d.VolumeName) { " ($($d.VolumeName))" } else { "" }
-        $mark = if ($d.DeviceID -eq $best.DeviceID) { "   ← больше всего места" } else { "" }
-        if (-not (Test-DriveFits $d $NeededGb $ProgramsGb)) { $mark = "   (мало места)" }
+        $hasExisting = Test-ExistingInstall $d.DeviceID
+        $mark = if ($hasExisting) {
+            "   ← уже установлено (обновление)"
+        } elseif ($d.DeviceID -eq $best.DeviceID) {
+            "   ← больше всего места"
+        } elseif (-not (Test-DriveFits $d $NeededGb $ProgramsGb)) {
+            "   (мало места для чистой установки)"
+        } else {
+            ""
+        }
         Write-Host ("      {0}) {1}{2}  свободно {3} ГБ из {4} ГБ{5}" -f ($i + 1), $d.DeviceID, $label, $free, $total, $mark)
     }
     for (;;) {
         $answer = Read-Host "    Введите номер диска и нажмите Enter (просто Enter — диск $($best.DeviceID))"
         $n = 0
-        $picked = $null
         if (-not $answer.Trim()) {
-            $picked = $best
+            return $best.DeviceID
         } elseif ([int]::TryParse($answer.Trim(), [ref]$n) -and $n -ge 1 -and $n -le $disks.Count) {
-            $picked = $disks[$n - 1]
+            return $disks[$n - 1].DeviceID
         } else {
             Write-Warn "Нет такого номера, попробуйте ещё раз."
-            continue
         }
-        if (Test-DriveFits $picked $NeededGb $ProgramsGb) { return $picked.DeviceID }
-        Write-Warn "На диске $($picked.DeviceID) мало места, выберите другой."
     }
 }
 
@@ -513,21 +525,31 @@ $ComfyRoot = Join-Path $ImagesPath "ComfyUI_windows_portable"
 
 $dataDrive = Split-Path -Qualifier $(if ($InstallRoot) { $InstallRoot } else { $env:SystemDrive + "\" })
 $systemFree = Get-FreeGb ($env:SystemDrive + "\")
+$isUpdate = (Test-Path -LiteralPath (Join-Path $ComfyRoot "ComfyUI\main.py")) -or (Test-ExistingInstall $dataDrive)
 if ($dataDrive -eq $env:SystemDrive) {
-    if ($systemFree -lt $programsGb + $dataGb) {
-        Stop-WithError "На диске $($env:SystemDrive) свободно $systemFree ГБ, а нужно хотя бы $($programsGb + $dataGb) ГБ. Запустите установку снова и выберите другой диск."
+    if ($isUpdate) {
+        Write-Ok "Найдена существующая установка на диске $($env:SystemDrive) — режим обновления (свободно $systemFree ГБ)"
+    } elseif ($systemFree -lt $programsGb + $dataGb) {
+        Write-Warn "На диске $($env:SystemDrive) свободно $systemFree ГБ (для чистой установки рекомендуется ~$($programsGb + $dataGb) ГБ). Продолжаю установку/обновление."
+    } else {
+        Write-Ok "Всё ставится на диск $($env:SystemDrive) (свободно $systemFree ГБ)"
     }
-    Write-Ok "Всё ставится на диск $($env:SystemDrive) (свободно $systemFree ГБ)"
 } else {
     $dataFree = Get-FreeGb $InstallRoot
-    if ($dataFree -lt $dataGb) {
-        Stop-WithError "На диске $dataDrive свободно $dataFree ГБ, а нужно хотя бы $dataGb ГБ."
+    if ($isUpdate) {
+        Write-Ok "Найдена существующая установка: $InstallRoot — режим обновления (свободно $dataFree ГБ)"
+    } else {
+        if ($dataFree -lt $dataGb) {
+            Write-Warn "На диске $dataDrive свободно $dataFree ГБ (для чистой установки рекомендуется ~$dataGb ГБ). Продолжаю установку/обновление."
+        } else {
+            Write-Ok "Модели и картинки: $InstallRoot (свободно $dataFree ГБ)"
+        }
+        if ($systemFree -lt $programsGb) {
+            Write-Warn "На диске $($env:SystemDrive) свободно $systemFree ГБ (для программ рекомендуется ~$programsGb ГБ)."
+        } else {
+            Write-Ok "Программы: диск $($env:SystemDrive) (~$programsGb ГБ, свободно $systemFree ГБ)"
+        }
     }
-    if ($systemFree -lt $programsGb) {
-        Stop-WithError "На диске $($env:SystemDrive) свободно $systemFree ГБ, а для программ нужно хотя бы $programsGb ГБ."
-    }
-    Write-Ok "Модели и картинки: $InstallRoot (свободно $dataFree ГБ)"
-    Write-Ok "Программы: диск $($env:SystemDrive) (~$programsGb ГБ, свободно $systemFree ГБ)"
 }
 Write-Ok "Заметки: $VaultPath"
 
